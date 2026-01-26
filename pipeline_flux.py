@@ -26,11 +26,14 @@ from transformers import (
     T5TokenizerFast,
 )
 
-from ...image_processor import PipelineImageInput, VaeImageProcessor
-from ...loaders import FluxIPAdapterMixin, FluxLoraLoaderMixin, FromSingleFileMixin, TextualInversionLoaderMixin
-from ...models import AutoencoderKL, FluxTransformer2DModel
-from ...schedulers import FlowMatchEulerDiscreteScheduler
-from ...utils import (
+from diffusers.image_processor import PipelineImageInput, VaeImageProcessor
+from diffusers.loaders import FluxIPAdapterMixin, FluxLoraLoaderMixin, FromSingleFileMixin, TextualInversionLoaderMixin
+from diffusers.models.autoencoders import AutoencoderKL
+from diffusers.models.transformers import FluxTransformer2DModel
+from diffusers.pipelines.flux.pipeline_output import FluxPipelineOutput
+from diffusers.pipelines.pipeline_utils import DiffusionPipeline
+from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
+from diffusers.utils import (
     USE_PEFT_BACKEND,
     deprecate,
     is_torch_xla_available,
@@ -39,9 +42,7 @@ from ...utils import (
     scale_lora_layers,
     unscale_lora_layers,
 )
-from ...utils.torch_utils import randn_tensor
-from ..pipeline_utils import DiffusionPipeline
-from .pipeline_output import FluxPipelineOutput
+from diffusers.utils.torch_utils import randn_tensor
 
 
 if is_torch_xla_available():
@@ -51,26 +52,41 @@ if is_torch_xla_available():
 else:
     XLA_AVAILABLE = False
 
-
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 EXAMPLE_DOC_STRING = """
     Examples:
         ```py
         >>> import torch
-        >>> from diffusers import FluxPipeline
+        >>> from diffusers import DiffusionPipeline
 
-        >>> pipe = FluxPipeline.from_pretrained("black-forest-labs/FLUX.1-schnell", torch_dtype=torch.bfloat16)
+        >>> pipe = DiffusionPipeline.from_pretrained(
+        >>>     "black-forest-labs/FLUX.1-dev",
+        >>>     custom_pipeline="pipeline_flux_semantic_guidance",
+        >>>     torch_dtype=torch.bfloat16
+        >>> )
         >>> pipe.to("cuda")
         >>> prompt = "A cat holding a sign that says hello world"
-        >>> # Depending on the variant being used, the pipeline call will slightly vary.
-        >>> # Refer to the pipeline documentation for more details.
-        >>> image = pipe(prompt, num_inference_steps=4, guidance_scale=0.0).images[0]
-        >>> image.save("flux.png")
+        >>> image = pipe(
+        >>>     prompt=prompt,
+        >>>     num_inference_steps=28,
+        >>>     guidance_scale=3.5,
+        >>>     editing_prompt=["cat", "dog"],  # changes from cat to dog.
+        >>>     reverse_editing_direction=[True, False],
+        >>>     edit_warmup_steps=[6, 8],
+        >>>     edit_guidance_scale=[6, 6.5],
+        >>>     edit_threshold=[0.89, 0.89],
+        >>>     edit_cooldown_steps = [25, 27],
+        >>>     edit_momentum_scale=0.3,
+        >>>     edit_mom_beta=0.6,
+        >>>     generator=torch.Generator(device="cuda").manual_seed(6543),
+        >>> ).images[0]
+        >>> image.save("semantic_flux.png")
         ```
 """
 
 
+# Copied from diffusers.pipelines.flux.pipeline_flux.calculate_shift
 def calculate_shift(
     image_seq_len,
     base_seq_len: int = 256,
@@ -144,7 +160,7 @@ def retrieve_timesteps(
     return timesteps, num_inference_steps
 
 
-class FluxPipeline(
+class FluxPrompt2PromptPipeline(
     DiffusionPipeline,
     FluxLoraLoaderMixin,
     FromSingleFileMixin,
@@ -215,6 +231,7 @@ class FluxPipeline(
         )
         self.default_sample_size = 128
 
+    # Copied from diffusers.pipelines.flux.pipeline_flux.FluxPipeline._get_t5_prompt_embeds
     def _get_t5_prompt_embeds(
         self,
         prompt: Union[str, List[str]] = None,
@@ -264,6 +281,7 @@ class FluxPipeline(
 
         return prompt_embeds
 
+    # Copied from diffusers.pipelines.flux.pipeline_flux.FluxPipeline._get_clip_prompt_embeds
     def _get_clip_prompt_embeds(
         self,
         prompt: Union[str, List[str]],
@@ -308,6 +326,7 @@ class FluxPipeline(
 
         return prompt_embeds
 
+    # Copied from diffusers.pipelines.flux.pipeline_flux.FluxPipeline.encode_prompt
     def encode_prompt(
         self,
         prompt: Union[str, List[str]],
@@ -387,6 +406,7 @@ class FluxPipeline(
 
         return prompt_embeds, pooled_prompt_embeds, text_ids
 
+    # Copied from diffusers.pipelines.flux.pipeline_flux.FluxPipeline.encode_image
     def encode_image(self, image, device, num_images_per_prompt):
         dtype = next(self.image_encoder.parameters()).dtype
 
@@ -398,6 +418,7 @@ class FluxPipeline(
         image_embeds = image_embeds.repeat_interleave(num_images_per_prompt, dim=0)
         return image_embeds
 
+    # Copied from diffusers.pipelines.flux.pipeline_flux.FluxPipeline.prepare_ip_adapter_image_embeds
     def prepare_ip_adapter_image_embeds(
         self, ip_adapter_image, ip_adapter_image_embeds, device, num_images_per_prompt
     ):
@@ -434,6 +455,7 @@ class FluxPipeline(
 
         return ip_adapter_image_embeds
 
+    # Copied from diffusers.pipelines.flux.pipeline_flux.FluxPipeline.check_inputs
     def check_inputs(
         self,
         prompt,
@@ -504,6 +526,7 @@ class FluxPipeline(
             raise ValueError(f"`max_sequence_length` cannot be greater than 512 but is {max_sequence_length}")
 
     @staticmethod
+    # Copied from diffusers.pipelines.flux.pipeline_flux.FluxPipeline._prepare_latent_image_ids
     def _prepare_latent_image_ids(batch_size, height, width, device, dtype):
         latent_image_ids = torch.zeros(height, width, 3)
         latent_image_ids[..., 1] = latent_image_ids[..., 1] + torch.arange(height)[:, None]
@@ -518,6 +541,7 @@ class FluxPipeline(
         return latent_image_ids.to(device=device, dtype=dtype)
 
     @staticmethod
+    # Copied from diffusers.pipelines.flux.pipeline_flux.FluxPipeline._pack_latents
     def _pack_latents(latents, batch_size, num_channels_latents, height, width):
         latents = latents.view(batch_size, num_channels_latents, height // 2, 2, width // 2, 2)
         latents = latents.permute(0, 2, 4, 1, 3, 5)
@@ -526,6 +550,7 @@ class FluxPipeline(
         return latents
 
     @staticmethod
+    # Copied from diffusers.pipelines.flux.pipeline_flux.FluxPipeline._unpack_latents
     def _unpack_latents(latents, height, width, vae_scale_factor):
         batch_size, num_patches, channels = latents.shape
 
@@ -541,32 +566,23 @@ class FluxPipeline(
 
         return latents
 
+    # Copied from diffusers.pipelines.flux.pipeline_flux.FluxPipeline.enable_vae_slicing
     def enable_vae_slicing(self):
         r"""
         Enable sliced VAE decoding. When this option is enabled, the VAE will split the input tensor in slices to
         compute decoding in several steps. This is useful to save some memory and allow larger batch sizes.
         """
-        depr_message = f"Calling `enable_vae_slicing()` on a `{self.__class__.__name__}` is deprecated and this method will be removed in a future version. Please use `pipe.vae.enable_slicing()`."
-        deprecate(
-            "enable_vae_slicing",
-            "0.40.0",
-            depr_message,
-        )
         self.vae.enable_slicing()
 
+    # Copied from diffusers.pipelines.flux.pipeline_flux.FluxPipeline.disable_vae_slicing
     def disable_vae_slicing(self):
         r"""
         Disable sliced VAE decoding. If `enable_vae_slicing` was previously enabled, this method will go back to
         computing decoding in one step.
         """
-        depr_message = f"Calling `disable_vae_slicing()` on a `{self.__class__.__name__}` is deprecated and this method will be removed in a future version. Please use `pipe.vae.disable_slicing()`."
-        deprecate(
-            "disable_vae_slicing",
-            "0.40.0",
-            depr_message,
-        )
         self.vae.disable_slicing()
 
+    # Copied from diffusers.pipelines.flux.pipeline_flux.FluxPipeline.enable_vae_tiling
     def enable_vae_tiling(self):
         r"""
         Enable tiled VAE decoding. When this option is enabled, the VAE will split the input tensor into tiles to
@@ -581,6 +597,7 @@ class FluxPipeline(
         )
         self.vae.enable_tiling()
 
+    # Copied from diffusers.pipelines.flux.pipeline_flux.FluxPipeline.disable_vae_tiling
     def disable_vae_tiling(self):
         r"""
         Disable tiled VAE decoding. If `enable_vae_tiling` was previously enabled, this method will go back to
@@ -594,6 +611,7 @@ class FluxPipeline(
         )
         self.vae.disable_tiling()
 
+    # Copied from diffusers.pipelines.flux.pipeline_flux.FluxPipeline.prepare_latents
     def prepare_latents(
         self,
         batch_size,
