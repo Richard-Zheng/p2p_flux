@@ -802,7 +802,7 @@ class FluxPrompt2PromptPipeline(
             images.
         """
 
-        self.controller = EmptyControl()
+        self.controller = EmptyControl(len(self.transformer.transformer_blocks), len(self.transformer.single_transformer_blocks))
         self.register_attention_control(self.controller)
 
         height = height or self.default_sample_size * self.vae_scale_factor
@@ -1043,10 +1043,11 @@ class FluxPrompt2PromptPipeline(
         return FluxPipelineOutput(images=image)
 
     def register_attention_control(self, controller):
-        attn_proc = P2PFluxAttnProcessor(controller=controller)
-        for index, tblock in enumerate(self.transformer.transformer_blocks):
+        for i, tblock in enumerate(self.transformer.transformer_blocks):
+            attn_proc = P2PFluxAttnProcessor(controller=controller, is_single=False, index=i)
             tblock.attn.set_processor(attn_proc)
-        for index, tblock in enumerate(self.transformer.single_transformer_blocks):
+        for i, tblock in enumerate(self.transformer.single_transformer_blocks):
+            attn_proc = P2PFluxAttnProcessor(controller=controller, is_single=True, index=i)
             tblock.attn.set_processor(attn_proc)
 
 
@@ -1087,9 +1088,11 @@ class P2PFluxAttnProcessor:
     _attention_backend = None
     _parallel_config = None
 
-    def __init__(self, controller):
+    def __init__(self, controller, is_single, index):
         super().__init__()
         self.controller = controller
+        self.is_single = is_single
+        self.index = index
 
     def __call__(
         self,
@@ -1148,7 +1151,7 @@ class P2PFluxAttnProcessor:
         )
 
         # one-liner
-        self.controller(attention_probs, is_single = (attn.added_kv_proj_dim is None))
+        self.controller(attention_probs, is_single = self.is_single, index = self.index)
 
         hidden_states = torch.bmm(attention_probs, value_reshaped)
         # hidden_states shape: (batch_size * heads, seq_len, head_dim)
@@ -1181,19 +1184,24 @@ class AttentionControl(abc.ABC):
         return
 
     @abc.abstractmethod
-    def forward(self, attn, is_single: bool):
+    def forward(self, attn, is_single: bool, index):
         raise NotImplementedError
 
-    def __call__(self, attn, is_single: bool):
-        attn = self.forward(attn, is_single)
+    def __call__(self, attn, is_single: bool, index):
+        attn = self.forward(attn, is_single, index)
         return attn
 
-    def __init__(self):
-        pass
+    def __init__(self, num_att_layers, num_single_att_layers):
+        self.num_att_layers = num_att_layers
+        self.num_single_att_layers = num_single_att_layers
 
 
 class EmptyControl(AttentionControl):
-    def forward(self, attn, is_single: bool):
+    def forward(self, attn, is_single: bool, index):
+        if is_single:
+            print(f'single attn[{index}] processed, total {self.num_single_att_layers}')
+        else:
+            print(f'attn[{index}] processed, total {self.num_att_layers}')
         return attn
 
 
@@ -1203,7 +1211,7 @@ class AttentionStore(AttentionControl):
         return [[], []]
         
 
-    def forward(self, attn, is_single: bool):
+    def forward(self, attn, is_single: bool, index):
         if is_single:
             self.step_store[0].append(attn)
         else:
@@ -1224,11 +1232,6 @@ class AttentionStore(AttentionControl):
             key: [item / self.cur_step for item in self.attention_store[key]] for key in range(2)
         }
         return average_attention
-
-    def reset(self):
-        super(AttentionStore, self).reset()
-        self.step_store = self.get_empty_store()
-        self.attention_store = {}
 
     def __init__(self):
         super(AttentionStore, self).__init__()
