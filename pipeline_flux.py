@@ -802,7 +802,7 @@ class FluxPrompt2PromptPipeline(
             images.
         """
 
-        self.controller = AttentionStore()
+        self.controller = EmptyControl()
         self.register_attention_control(self.controller)
 
         height = height or self.default_sample_size * self.vae_scale_factor
@@ -1014,6 +1014,9 @@ class FluxPrompt2PromptPipeline(
                     latents = callback_outputs.pop("latents", latents)
                     prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
 
+                # step callback
+                latents = self.controller.step_callback(latents, is_last_step=(i == len(timesteps) - 1))
+
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
@@ -1145,7 +1148,7 @@ class P2PFluxAttnProcessor:
         )
 
         # one-liner
-        # self.controller(attention_probs, is_single = (attn.added_kv_proj_dim is None))
+        self.controller(attention_probs, is_single = (attn.added_kv_proj_dim is None))
 
         hidden_states = torch.bmm(attention_probs, value_reshaped)
         # hidden_states shape: (batch_size * heads, seq_len, head_dim)
@@ -1169,76 +1172,56 @@ class P2PFluxAttnProcessor:
 
 
 class AttentionControl(abc.ABC):
-    def step_callback(self, x_t):
+    def step_callback(self, x_t, is_last_step: bool):
+        if not is_last_step:
+            self.between_steps()
         return x_t
 
     def between_steps(self):
         return
-
-    @property
-    def num_uncond_att_layers(self):
-        return 0
 
     @abc.abstractmethod
     def forward(self, attn, is_single: bool):
         raise NotImplementedError
 
     def __call__(self, attn, is_single: bool):
-        if self.cur_att_layer >= self.num_uncond_att_layers:
-            h = attn.shape[0]
-            attn[h // 2 :] = self.forward(attn[h // 2 :], is_single)
-        self.cur_att_layer += 1
-        if self.cur_att_layer == self.num_att_layers + self.num_uncond_att_layers:
-            self.cur_att_layer = 0
-            self.cur_step += 1
-            self.between_steps()
+        attn = self.forward(attn, is_single)
         return attn
 
-    def reset(self):
-        self.cur_step = 0
-        self.cur_att_layer = 0
-
     def __init__(self):
-        self.cur_step = 0
-        self.num_att_layers = -1
-        self.cur_att_layer = 0
+        pass
 
 
 class EmptyControl(AttentionControl):
-    def forward(self, attn, is_cross: bool, place_in_unet: str):
+    def forward(self, attn, is_single: bool):
         return attn
 
 
 class AttentionStore(AttentionControl):
     @staticmethod
     def get_empty_store():
-        return {
-            "down_cross": [],
-            "mid_cross": [],
-            "up_cross": [],
-            "down_self": [],
-            "mid_self": [],
-            "up_self": [],
-        }
+        return [[], []]
+        
 
-    def forward(self, attn, is_cross: bool, place_in_unet: str):
-        key = f"{place_in_unet}_{'cross' if is_cross else 'self'}"
-        if attn.shape[1] <= 32**2:  # avoid memory overhead
-            self.step_store[key].append(attn)
+    def forward(self, attn, is_single: bool):
+        if is_single:
+            self.step_store[0].append(attn)
+        else:
+            self.step_store[1].append(attn)
         return attn
 
     def between_steps(self):
         if len(self.attention_store) == 0:
             self.attention_store = self.step_store
         else:
-            for key in self.attention_store:
+            for key in range(2):
                 for i in range(len(self.attention_store[key])):
                     self.attention_store[key][i] += self.step_store[key][i]
         self.step_store = self.get_empty_store()
 
     def get_average_attention(self):
         average_attention = {
-            key: [item / self.cur_step for item in self.attention_store[key]] for key in self.attention_store
+            key: [item / self.cur_step for item in self.attention_store[key]] for key in range(2)
         }
         return average_attention
 
