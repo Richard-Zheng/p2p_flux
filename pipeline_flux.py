@@ -1138,17 +1138,33 @@ class P2PFluxAttnProcessor:
         if image_rotary_emb is not None:
             query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
             key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+        
+        # q k v shape: (batch_size, seq_len, heads, head_dim) [1, 4608, 24, 128]
+        # to use attn.get_attention_scores() we need to reshape to (batch_size * heads, seq_len, head_dim)
+        batch_size, seq_len, heads, head_dim = query.shape[0]
+        query_reshaped = query.permute(0, 2, 1, 3).reshape(-1, query.shape[1], query.shape[3])
+        key_reshaped = key.permute(0, 2, 1, 3).reshape(-1, key.shape[1], key.shape[3])
+        value_reshaped = value.permute(0, 2, 1, 3).reshape(-1, value.shape[1], value.shape[3])
 
-        # TODO: hook attention probablities
-        # self.controller(attention_probs, is_cross, self.place_in_unet)
-        hidden_states = dispatch_attention_fn(
-            query,
-            key,
-            value,
-            attn_mask=attention_mask,
-            backend=self._attention_backend,
-            parallel_config=self._parallel_config,
+        # the original dispatch_attention_fn uses torch.nn.functional.scaled_dot_product_attention
+        # which is highly optimized to be numerically stable in float16 or bfloat16 by using online softmax(?)
+        # we don't have that. So we upcast to float32 here to be safe.
+        attn.upcast_attention = True
+        attn.upcast_softmax = True
+
+        attn.scale = attn.head_dim**-0.5
+
+        attention_probs = attn.get_attention_scores(
+            query_reshaped,
+            key_reshaped,
+            attention_mask=attention_mask,
         )
+        self.controller(attention_probs, is_cross, self.place_in_unet)
+        hidden_states = torch.bmm(attention_probs, value_reshaped)
+        # hidden_states shape: (batch_size * heads, seq_len, head_dim)
+        # reshape back to (batch_size, seq_len, heads, head_dim)
+        hidden_states = hidden_states.view(batch_size, attn.heads, seq_len, attn.head_dim).permute(0, 2, 1, 3)
+        # flatten heads and head_dim
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
 
@@ -1163,6 +1179,7 @@ class P2PFluxAttnProcessor:
             return hidden_states, encoder_hidden_states
         else:
             return hidden_states
+
 
 class AttentionControl(abc.ABC):
     def step_callback(self, x_t):
