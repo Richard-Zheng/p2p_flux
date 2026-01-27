@@ -45,6 +45,8 @@ from diffusers.utils import (
 )
 from diffusers.utils.torch_utils import randn_tensor
 
+from diffusers.models.transformers.transformer_flux import FluxAttention
+
 
 if is_torch_xla_available():
     import torch_xla.core.xla_model as xm
@@ -1061,7 +1063,7 @@ class FluxPrompt2PromptPipeline(
         controller.num_att_layers = cross_att_count
 
 
-# copied from diffusers.models.transformers.transformer_flax._get_projections
+# copied from diffusers.models.transformers.transformer_flux._get_projections
 def _get_projections(attn: "FluxAttention", hidden_states, encoder_hidden_states=None):
     query = attn.to_q(hidden_states)
     key = attn.to_k(hidden_states)
@@ -1076,7 +1078,7 @@ def _get_projections(attn: "FluxAttention", hidden_states, encoder_hidden_states
     return query, key, value, encoder_query, encoder_key, encoder_value
 
 
-# copied from diffusers.models.transformers.transformer_flax._get_fused_projections
+# copied from diffusers.models.transformers.transformer_flux._get_fused_projections
 def _get_fused_projections(attn: "FluxAttention", hidden_states, encoder_hidden_states=None):
     query, key, value = attn.to_qkv(hidden_states).chunk(3, dim=-1)
 
@@ -1087,14 +1089,14 @@ def _get_fused_projections(attn: "FluxAttention", hidden_states, encoder_hidden_
     return query, key, value, encoder_query, encoder_key, encoder_value
 
 
-# copied from diffusers.models.transformers.transformer_flax._get_qkv_projections
+# copied from diffusers.models.transformers.transformer_flux._get_qkv_projections
 def _get_qkv_projections(attn: "FluxAttention", hidden_states, encoder_hidden_states=None):
     if attn.fused_projections:
         return _get_fused_projections(attn, hidden_states, encoder_hidden_states)
     return _get_projections(attn, hidden_states, encoder_hidden_states)
 
 
-# copied from diffusers.models.transformers.transformer_flax.FluxAttnProcessor
+# copied from diffusers.models.transformers.transformer_flux.FluxAttnProcessor
 class P2PFluxAttnProcessor:
     _attention_backend = None
     _parallel_config = None
