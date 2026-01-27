@@ -1125,7 +1125,7 @@ class P2PFluxAttnProcessor:
         
         # q k v shape: (batch_size, seq_len, heads, head_dim) [1, 4608, 24, 128]
         # to use attn.get_attention_scores() we need to reshape to (batch_size * heads, seq_len, head_dim)
-        batch_size, seq_len, heads, head_dim = query.shape[0]
+        batch_size, seq_len, heads, head_dim = query.shape
         query_reshaped = query.permute(0, 2, 1, 3).reshape(-1, query.shape[1], query.shape[3])
         key_reshaped = key.permute(0, 2, 1, 3).reshape(-1, key.shape[1], key.shape[3])
         value_reshaped = value.permute(0, 2, 1, 3).reshape(-1, value.shape[1], value.shape[3])
