@@ -45,6 +45,7 @@ from diffusers.utils import (
 )
 from diffusers.utils.torch_utils import randn_tensor
 
+from diffusers.models.embeddings import apply_rotary_emb
 from diffusers.models.transformers.transformer_flux import FluxAttention
 
 
@@ -1039,28 +1040,11 @@ class FluxPrompt2PromptPipeline(
         return FluxPipelineOutput(images=image)
 
     def register_attention_control(self, controller):
-        attn_procs = {}
-        cross_att_count = 0
-        for name in self.unet.attn_processors.keys():
-            (None if name.endswith("attn1.processor") else self.unet.config.cross_attention_dim)
-            if name.startswith("mid_block"):
-                self.unet.config.block_out_channels[-1]
-                place_in_unet = "mid"
-            elif name.startswith("up_blocks"):
-                block_id = int(name[len("up_blocks.")])
-                list(reversed(self.unet.config.block_out_channels))[block_id]
-                place_in_unet = "up"
-            elif name.startswith("down_blocks"):
-                block_id = int(name[len("down_blocks.")])
-                self.unet.config.block_out_channels[block_id]
-                place_in_unet = "down"
-            else:
-                continue
-            cross_att_count += 1
-            attn_procs[name] = P2PFluxAttnProcessor(controller=controller, place_in_unet=place_in_unet)
-
-        self.unet.set_attn_processor(attn_procs)
-        controller.num_att_layers = cross_att_count
+        attn_proc = P2PFluxAttnProcessor(controller=controller)
+        for index, tblock in enumerate(self.transformer.transformer_blocks):
+            tblock.attn.set_processor(attn_proc)
+        for index, tblock in enumerate(self.transformer.single_transformer_blocks):
+            tblock.attn.set_processor(attn_proc)
 
 
 # copied from diffusers.models.transformers.transformer_flux._get_projections
@@ -1096,15 +1080,13 @@ def _get_qkv_projections(attn: "FluxAttention", hidden_states, encoder_hidden_st
     return _get_projections(attn, hidden_states, encoder_hidden_states)
 
 
-# copied from diffusers.models.transformers.transformer_flux.FluxAttnProcessor
 class P2PFluxAttnProcessor:
     _attention_backend = None
     _parallel_config = None
 
-    def __init__(self, controller, place_in_unet):
+    def __init__(self, controller):
         super().__init__()
         self.controller = controller
-        self.place_in_unet = place_in_unet
 
     def __call__(
         self,
@@ -1161,7 +1143,10 @@ class P2PFluxAttnProcessor:
             key_reshaped,
             attention_mask=attention_mask,
         )
-        self.controller(attention_probs, is_cross, self.place_in_unet)
+
+        # one-liner
+        # self.controller(attention_probs, is_single = (attn.added_kv_proj_dim is None))
+
         hidden_states = torch.bmm(attention_probs, value_reshaped)
         # hidden_states shape: (batch_size * heads, seq_len, head_dim)
         # reshape back to (batch_size, seq_len, heads, head_dim)
@@ -1195,13 +1180,13 @@ class AttentionControl(abc.ABC):
         return 0
 
     @abc.abstractmethod
-    def forward(self, attn, is_cross: bool, place_in_unet: str):
+    def forward(self, attn, is_single: bool):
         raise NotImplementedError
 
-    def __call__(self, attn, is_cross: bool, place_in_unet: str):
+    def __call__(self, attn, is_single: bool):
         if self.cur_att_layer >= self.num_uncond_att_layers:
             h = attn.shape[0]
-            attn[h // 2 :] = self.forward(attn[h // 2 :], is_cross, place_in_unet)
+            attn[h // 2 :] = self.forward(attn[h // 2 :], is_single)
         self.cur_att_layer += 1
         if self.cur_att_layer == self.num_att_layers + self.num_uncond_att_layers:
             self.cur_att_layer = 0
