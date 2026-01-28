@@ -802,7 +802,11 @@ class FluxPrompt2PromptPipeline(
             images.
         """
 
-        self.controller = EmptyControl(len(self.transformer.transformer_blocks), len(self.transformer.single_transformer_blocks))
+        self.controller = AttentionStore(
+            len(self.transformer.transformer_blocks),
+            len(self.transformer.single_transformer_blocks),
+            num_inference_steps,
+        )
         self.register_attention_control(self.controller)
 
         height = height or self.default_sample_size * self.vae_scale_factor
@@ -1191,9 +1195,10 @@ class AttentionControl(abc.ABC):
         attn = self.forward(attn, is_single, index)
         return attn
 
-    def __init__(self, num_att_layers, num_single_att_layers):
+    def __init__(self, num_att_layers, num_single_att_layers, num_inference_steps):
         self.num_att_layers = num_att_layers
         self.num_single_att_layers = num_single_att_layers
+        self.num_inference_steps = num_inference_steps
 
 
 class EmptyControl(AttentionControl):
@@ -1206,34 +1211,28 @@ class EmptyControl(AttentionControl):
 
 
 class AttentionStore(AttentionControl):
-    @staticmethod
-    def get_empty_store():
-        return [[], []]
-        
-
     def forward(self, attn, is_single: bool, index):
-        if is_single:
-            self.step_store[0].append(attn)
-        else:
-            self.step_store[1].append(attn)
+        if not is_single:
+            # store attention maps for MM-DiT layers only
+            # attn shape: (batch_size * heads, prompt_seq+latent_seq, prompt_seq+latent_seq)
+            # here we assume batch_size=1 during inference
+            # prompt_seq 512 for 77 tokens, latent_seq 4096 for 64x64 latent image
+            # extract prompt->latent attention maps only
+            heads, seq_len, _ = attn.shape
+            prompt_seq_len = 512
+            latent_seq_len = seq_len - prompt_seq_len
+            prompt_to_latent_attn = attn[:, :prompt_seq_len, prompt_seq_len:]
+            # now the shape is (batch_size * heads, prompt_seq, latent_seq) softmaxed over latent_seq
+            # average over heads and self.num_att_layers and self.num_inference_steps
+            prompt_to_latent_attn = prompt_to_latent_attn.mean(dim=0) / self.num_att_layers / self.num_inference_steps
+            # now add to step_store, take average over self.num_att_layers
+            if self.attention_store is None:
+                self.attention_store = prompt_to_latent_attn
+            else:
+                self.attention_store += prompt_to_latent_attn
+            del prompt_to_latent_attn
         return attn
 
-    def between_steps(self):
-        if len(self.attention_store) == 0:
-            self.attention_store = self.step_store
-        else:
-            for key in range(2):
-                for i in range(len(self.attention_store[key])):
-                    self.attention_store[key][i] += self.step_store[key][i]
-        self.step_store = self.get_empty_store()
-
-    def get_average_attention(self):
-        average_attention = {
-            key: [item / self.cur_step for item in self.attention_store[key]] for key in range(2)
-        }
-        return average_attention
-
-    def __init__(self):
-        super(AttentionStore, self).__init__()
-        self.step_store = self.get_empty_store()
-        self.attention_store = {}
+    def __init__(self, num_att_layers, num_single_att_layers, num_inference_steps):
+        super().__init__(num_att_layers, num_single_att_layers, num_inference_steps)
+        self.attention_store = None
