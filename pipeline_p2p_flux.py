@@ -802,13 +802,6 @@ class FluxPrompt2PromptPipeline(
             images.
         """
 
-        self.controller = AttentionStore(
-            len(self.transformer.transformer_blocks),
-            len(self.transformer.single_transformer_blocks),
-            num_inference_steps,
-        )
-        self.register_attention_control(self.controller)
-
         height = height or self.default_sample_size * self.vae_scale_factor
         width = width or self.default_sample_size * self.vae_scale_factor
 
@@ -1018,9 +1011,6 @@ class FluxPrompt2PromptPipeline(
                     latents = callback_outputs.pop("latents", latents)
                     prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
 
-                # step callback
-                latents = self.controller.step_callback(latents, is_last_step=(i == len(timesteps) - 1))
-
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
@@ -1045,14 +1035,6 @@ class FluxPrompt2PromptPipeline(
             return (image,)
 
         return FluxPipelineOutput(images=image)
-
-    def register_attention_control(self, controller):
-        for i, tblock in enumerate(self.transformer.transformer_blocks):
-            attn_proc = P2PFluxAttnProcessor(controller=controller, is_single=False, index=i)
-            tblock.attn.set_processor(attn_proc)
-        for i, tblock in enumerate(self.transformer.single_transformer_blocks):
-            attn_proc = P2PFluxAttnProcessor(controller=controller, is_single=True, index=i)
-            tblock.attn.set_processor(attn_proc)
 
 
 # copied from diffusers.models.transformers.transformer_flux._get_projections
@@ -1132,7 +1114,7 @@ class P2PFluxAttnProcessor:
         if image_rotary_emb is not None:
             query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
             key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
-        
+
         # q k v shape: (batch_size, seq_len, heads, head_dim) [1, 4608, 24, 128]
         # to use attn.get_attention_scores() we need to reshape to (batch_size * heads, seq_len, head_dim)
         batch_size, seq_len, heads, head_dim = query.shape
@@ -1179,13 +1161,13 @@ class P2PFluxAttnProcessor:
 
 
 class AttentionControl(abc.ABC):
-    def step_callback(self, x_t, is_last_step: bool):
-        if not is_last_step:
-            self.between_steps()
-        return x_t
-
-    def between_steps(self):
-        return
+    def register_attention_control(self, pipe):
+        for i, tblock in enumerate(pipe.transformer.transformer_blocks):
+            attn_proc = P2PFluxAttnProcessor(controller=self, is_single=False, index=i)
+            tblock.attn.set_processor(attn_proc)
+        for i, tblock in enumerate(pipe.transformer.single_transformer_blocks):
+            attn_proc = P2PFluxAttnProcessor(controller=self, is_single=True, index=i)
+            tblock.attn.set_processor(attn_proc)
 
     @abc.abstractmethod
     def forward(self, attn, is_single: bool, index):
