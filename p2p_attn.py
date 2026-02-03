@@ -84,9 +84,9 @@ class P2PFluxAttnProcessor:
         # q k v shape: (batch_size, seq_len, heads, head_dim) [1, 4608, 24, 128]
         # to use attn.get_attention_scores() we need to reshape to (batch_size * heads, seq_len, head_dim)
         batch_size, seq_len, heads, head_dim = query.shape
-        query_reshaped = query.permute(0, 2, 1, 3).reshape(-1, query.shape[1], query.shape[3])
-        key_reshaped = key.permute(0, 2, 1, 3).reshape(-1, key.shape[1], key.shape[3])
-        value_reshaped = value.permute(0, 2, 1, 3).reshape(-1, value.shape[1], value.shape[3])
+        query = query.permute(0, 2, 1, 3).reshape(-1, query.shape[1], query.shape[3])
+        key = key.permute(0, 2, 1, 3).reshape(-1, key.shape[1], key.shape[3])
+        value = value.permute(0, 2, 1, 3).reshape(-1, value.shape[1], value.shape[3])
 
         # the original dispatch_attention_fn uses torch.nn.functional.scaled_dot_product_attention
         # which is highly optimized to be numerically stable in float16 or bfloat16 by using online softmax(?)
@@ -97,15 +97,15 @@ class P2PFluxAttnProcessor:
         attn.scale = attn.head_dim**-0.5
 
         attention_probs = attn.get_attention_scores(
-            query_reshaped,
-            key_reshaped,
+            query,
+            key,
             attention_mask=attention_mask,
         )
 
         # one-liner
         self.attn_map_callback(attention_probs)
 
-        hidden_states = torch.bmm(attention_probs, value_reshaped)
+        hidden_states = torch.bmm(attention_probs, value)
         # hidden_states shape: (batch_size * heads, seq_len, head_dim)
         # reshape back to (batch_size, seq_len, heads, head_dim)
         hidden_states = hidden_states.view(batch_size, attn.heads, seq_len, attn.head_dim).permute(0, 2, 1, 3)
