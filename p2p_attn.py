@@ -141,10 +141,11 @@ class AttentionControl(abc.ABC):
     def on_attn_map(self, attn, is_single: bool, index):
         raise NotImplementedError
 
-    def __init__(self, num_att_layers, num_single_att_layers, num_inference_steps):
+    def __init__(self, num_att_layers, num_single_att_layers, num_inference_steps, batch_size=1):
         self.num_att_layers = num_att_layers
         self.num_single_att_layers = num_single_att_layers
         self.num_inference_steps = num_inference_steps
+        self.batch_size = batch_size
 
 
 class EmptyControl(AttentionControl):
@@ -159,18 +160,23 @@ class EmptyControl(AttentionControl):
 class AttentionStore(AttentionControl):
     def on_attn_map(self, attn, is_single: bool, index):
         if not is_single:
-            # store attention maps for MM-DiT layers only
             # attn shape: (batch_size * heads, prompt_seq+latent_seq, prompt_seq+latent_seq)
-            # here we assume batch_size=1 during inference
+            # first we verify every line sums to 1
+            assert torch.allclose(attn.sum(dim=-1), torch.ones_like(attn.sum(dim=-1)), rtol=0.01), f'Attention map rows sums to {attn.sum(dim=-1)}'
+
+            # store attention maps for MM-DiT layers only
             # prompt_seq 512 for 77 tokens, latent_seq 4096 for 64x64 latent image
             # extract prompt->latent attention maps only
-            heads, seq_len, _ = attn.shape
+            batch_heads, seq_len, _ = attn.shape
+            assert batch_heads % self.batch_size == 0, f'batch_heads {batch_heads} not divisible by batch_size {self.batch_size}'
+            heads = batch_heads // self.batch_size
             prompt_seq_len = 512
             latent_seq_len = seq_len - prompt_seq_len
             prompt_to_latent_attn = attn[:, :prompt_seq_len, prompt_seq_len:]
             # now the shape is (batch_size * heads, prompt_seq, latent_seq) softmaxed over latent_seq
             # average over heads and self.num_att_layers and self.num_inference_steps
-            prompt_to_latent_attn = prompt_to_latent_attn.mean(dim=0) / self.num_att_layers / self.num_inference_steps
+            prompt_to_latent_attn = prompt_to_latent_attn.reshape(self.batch_size, heads, prompt_seq_len, latent_seq_len)
+            prompt_to_latent_attn = prompt_to_latent_attn.mean(dim=1) / self.num_att_layers / self.num_inference_steps
             # now add to step_store, take average over self.num_att_layers
             if self.attention_store is None:
                 self.attention_store = prompt_to_latent_attn
@@ -179,7 +185,7 @@ class AttentionStore(AttentionControl):
             del prompt_to_latent_attn
         return attn
 
-    def __init__(self, num_att_layers, num_single_att_layers, num_inference_steps):
-        super().__init__(num_att_layers, num_single_att_layers, num_inference_steps)
+    def __init__(self, num_att_layers, num_single_att_layers, num_inference_steps, batch_size=1):
+        super().__init__(num_att_layers, num_single_att_layers, num_inference_steps, batch_size)
         self.attention_store = None
 

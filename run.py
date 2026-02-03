@@ -6,15 +6,21 @@ from p2p_attn import AttentionStore
 pipe = FluxPipeline.from_pretrained("/home/frain/Documents/FLUX.1-dev", torch_dtype=torch.bfloat16)
 pipe.enable_sequential_cpu_offload() #save some VRAM by offloading the model to CPU. Remove this if you have enough GPU power
 
+prompt = "An astronaut pinpointing a flag that says hello world on the surface of Mars, digital art"
 num_inference_steps = 20
+
+if prompt is not None and isinstance(prompt, str):
+    batch_size = 1
+elif prompt is not None and isinstance(prompt, list):
+    batch_size = len(prompt)
 controller = AttentionStore(
     len(pipe.transformer.transformer_blocks),
     len(pipe.transformer.single_transformer_blocks),
     num_inference_steps,
+    batch_size=batch_size,
 )
 controller.register_attention_control(pipe)
 
-prompt = "An astronaut pinpointing a flag that says hello world on the surface of Mars, digital art"
 tokens = pipe.tokenizer_2(
             prompt,
             return_length=False,
@@ -88,5 +94,5 @@ def cross_attention_img(attention_maps, tokens, decoder):
         images.append(image)
     return image_grid(np.stack(images, axis=0))
 
-ca_img = cross_attention_img(controller.attention_store.to(dtype=torch.float32).cpu().float(), tokens, pipe.tokenizer_2.decode)
+ca_img = cross_attention_img(controller.attention_store[0].to(dtype=torch.float32).cpu().float(), tokens, pipe.tokenizer_2.decode)
 ca_img.save("flux-dev-attention.png")
