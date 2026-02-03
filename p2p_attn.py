@@ -42,11 +42,9 @@ class P2PFluxAttnProcessor:
     _attention_backend = None
     _parallel_config = None
 
-    def __init__(self, controller, is_single, index):
+    def __init__(self, attn_map_callback):
         super().__init__()
-        self.controller = controller
-        self.is_single = is_single
-        self.index = index
+        self.attn_map_callback = attn_map_callback
 
     def __call__(
         self,
@@ -105,7 +103,7 @@ class P2PFluxAttnProcessor:
         )
 
         # one-liner
-        self.controller(attention_probs, is_single = self.is_single, index = self.index)
+        self.attn_map_callback(attention_probs)
 
         hidden_states = torch.bmm(attention_probs, value_reshaped)
         # hidden_states shape: (batch_size * heads, seq_len, head_dim)
@@ -131,19 +129,17 @@ class P2PFluxAttnProcessor:
 class AttentionControl(abc.ABC):
     def register_attention_control(self, pipe):
         for i, tblock in enumerate(pipe.transformer.transformer_blocks):
-            attn_proc = P2PFluxAttnProcessor(controller=self, is_single=False, index=i)
+            attn_map_callback = lambda probs, idx=i: self.on_attn_map(probs, is_single=False, index=idx)
+            attn_proc = P2PFluxAttnProcessor(attn_map_callback=attn_map_callback)
             tblock.attn.set_processor(attn_proc)
         for i, tblock in enumerate(pipe.transformer.single_transformer_blocks):
-            attn_proc = P2PFluxAttnProcessor(controller=self, is_single=True, index=i)
+            attn_map_callback = lambda probs, idx=i: self.on_attn_map(probs, is_single=True, index=idx)
+            attn_proc = P2PFluxAttnProcessor(attn_map_callback=attn_map_callback)
             tblock.attn.set_processor(attn_proc)
 
     @abc.abstractmethod
-    def forward(self, attn, is_single: bool, index):
+    def on_attn_map(self, attn, is_single: bool, index):
         raise NotImplementedError
-
-    def __call__(self, attn, is_single: bool, index):
-        attn = self.forward(attn, is_single, index)
-        return attn
 
     def __init__(self, num_att_layers, num_single_att_layers, num_inference_steps):
         self.num_att_layers = num_att_layers
@@ -152,7 +148,7 @@ class AttentionControl(abc.ABC):
 
 
 class EmptyControl(AttentionControl):
-    def forward(self, attn, is_single: bool, index):
+    def on_attn_map(self, attn, is_single: bool, index):
         if is_single:
             print(f'single attn[{index}] processed, total {self.num_single_att_layers}')
         else:
@@ -161,7 +157,7 @@ class EmptyControl(AttentionControl):
 
 
 class AttentionStore(AttentionControl):
-    def forward(self, attn, is_single: bool, index):
+    def on_attn_map(self, attn, is_single: bool, index):
         if not is_single:
             # store attention maps for MM-DiT layers only
             # attn shape: (batch_size * heads, prompt_seq+latent_seq, prompt_seq+latent_seq)
