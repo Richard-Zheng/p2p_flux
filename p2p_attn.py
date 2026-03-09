@@ -269,7 +269,7 @@ class AttentionStore(AttentionControl):
             assert torch.allclose(attn.sum(dim=-1), torch.ones_like(attn.sum(dim=-1)), rtol=0.01), f'Attention map rows sums to {attn.sum(dim=-1)}'
 
             # store attention maps for MM-DiT layers only
-            # prompt_seq 512 for 77 tokens, latent_seq 4096 for 64x64 latent image
+            # prompt_seq 512 tokens, latent_seq 4096 for 64x64 latent image
             # extract prompt->latent attention maps only
             batch_heads, seq_len, _ = attn.shape
             assert batch_heads % self.batch_size == 0, f'batch_heads {batch_heads} not divisible by batch_size {self.batch_size}'
@@ -296,3 +296,30 @@ class AttentionStore(AttentionControl):
         super().__init__(prompts, pipeline, num_inference_steps)
         self.attention_store = None
 
+
+class AttentionControlEdit(AttentionControl):
+    @abc.abstractmethod
+    def replace_cross_attention(self, attn_base, att_replace):
+        raise NotImplementedError
+
+    def on_attn_map(self, attn, is_single: bool, index):
+        if not is_single:
+            batch_heads, seq_len, _ = attn.shape
+            assert batch_heads % self.batch_size == 0, f'batch_heads {batch_heads} not divisible by batch_size {self.batch_size}'
+            heads = batch_heads // self.batch_size
+            prompt_seq_len = 512
+            latent_seq_len = seq_len - prompt_seq_len
+            prompt_to_latent_attn = attn[:, :prompt_seq_len, prompt_seq_len:]
+            # now the shape is (batch_size * heads, prompt_seq, latent_seq) softmaxed over latent_seq
+            assert prompt_to_latent_attn.shape == (self.batch_size * heads, prompt_seq_len, latent_seq_len)
+
+            attn_base, attn_replace = prompt_to_latent_attn[0], prompt_to_latent_attn[1:]
+            alpha = self.cross_replace_alpha[index] if self.cross_replace_alpha is not None else 1.0
+            attn_replace_new = self.replace_cross_attention(attn_base, attn_replace) * alpha + attn_replace * (1 - alpha)
+            attn[1:, :prompt_seq_len, prompt_seq_len:] = attn_replace_new
+        return attn
+
+    def __init__(self, prompts, pipeline, num_inference_steps):
+        super().__init__(prompts, pipeline, num_inference_steps)
+        # TODO
+        self.cross_replace_alpha = None
