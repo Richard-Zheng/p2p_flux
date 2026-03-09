@@ -1,8 +1,112 @@
 import abc
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+import numpy as np
+import itertools
 import torch
 from diffusers.models.transformers.transformer_flux import FluxAttention
 from diffusers.models.embeddings import apply_rotary_emb
+
+
+# copied from examples/community/pipeline_prompt2prompt.py
+def update_alpha_time_word(
+    alpha,
+    bounds: Union[float, Tuple[float, float]],
+    prompt_ind: int,
+    word_inds: Optional[torch.Tensor] = None,
+):
+    """
+    Updates the alpha tensor based on the temporal bounds for cross-attention replacement.
+
+    Args:
+        alpha: The tensor storing attention weights modification values.
+        bounds: A float (threshold) or a tuple (start, end) indicating the time steps to modify.
+        prompt_ind: Verify the prompt index to begin the modification.
+        word_inds: Indices of the words (tokens) to modify. If None, all words are modified.
+
+    Returns:
+        The updated alpha tensor.
+    """
+    if isinstance(bounds, float):
+        bounds = 0, bounds
+    start, end = int(bounds[0] * alpha.shape[0]), int(bounds[1] * alpha.shape[0])
+    if word_inds is None:
+        word_inds = torch.arange(alpha.shape[2])
+    alpha[:start, prompt_ind, word_inds] = 0
+    alpha[start:end, prompt_ind, word_inds] = 1
+    alpha[end:, prompt_ind, word_inds] = 0
+    return alpha
+
+
+def get_word_inds(text: str, target_word: Union[str, int], tokenizer) -> np.ndarray:
+    words = text.split(" ")
+    # strip the </s> end-of-sentence token
+    tokens = [tokenizer.decode([item]) for item in tokenizer.encode(text)][:-1]
+
+    # word_ends[i] = the index where i+1 word ends (not counting spaces)
+    word_ends = list(itertools.accumulate(len(w) for w in words))
+    token_ends = list(itertools.accumulate(len(t) for t in tokens))
+
+    if isinstance(target_word, str):
+        target_word_indices = [i for i, w in enumerate(words) if w == target_word]
+    elif isinstance(target_word, int):
+        target_word_indices = [target_word]
+    else:
+        raise TypeError("target_word must be either a string or an integer.")
+
+    valid_ranges = []
+    for idx in target_word_indices:
+        start_char = 0 if idx == 0 else word_ends[idx - 1]
+        end_char = word_ends[idx]
+        valid_ranges.append((start_char, end_char))
+
+    out = []
+    for tok_idx, tok_end in enumerate(token_ends):
+        if len(tokens[tok_idx]) == 0:
+            if any(start <= tok_end <= end for start, end in valid_ranges):
+                out.append(tok_idx)
+        elif any(start < tok_end <= end for start, end in valid_ranges):
+            out.append(tok_idx)
+
+    return np.array(out)
+
+
+# copied from examples/community/pipeline_prompt2prompt.py
+def get_time_words_attention_alpha(
+    prompts,
+    num_steps,
+    cross_replace_steps: Union[float, Dict[str, Tuple[float, float]]],
+    tokenizer,
+    max_num_words=512,
+):
+    """
+    Computes the alpha tensor controlling cross-attention replacement over time and words.
+
+    Args:
+        prompts: A list of text prompts.
+        num_steps: The number of inference steps.
+        cross_replace_steps: A dictionary or float defining the time steps for cross-attention replacement.
+                             If a dictionary, keys are words and values are (start, end) tuples.
+        tokenizer: The tokenizer for encoding prompts.
+        max_num_words: The maximum number of words (tokens) to consider.
+
+    Returns:
+        A tensor of shape (num_steps + 1, len(prompts) - 1, 1, 1, max_num_words) containing the alpha values.
+    """
+    if not isinstance(cross_replace_steps, dict):
+        cross_replace_steps = {"default_": cross_replace_steps}
+    if "default_" not in cross_replace_steps:
+        cross_replace_steps["default_"] = (0.0, 1.0)
+    alpha_time_words = torch.zeros(num_steps + 1, len(prompts) - 1, max_num_words)
+    for i in range(len(prompts) - 1):
+        alpha_time_words = update_alpha_time_word(alpha_time_words, cross_replace_steps["default_"], i)
+    for key, item in cross_replace_steps.items():
+        if key != "default_":
+            inds = [get_word_inds(prompts[i], key, tokenizer) for i in range(1, len(prompts))]
+            for i, ind in enumerate(inds):
+                if len(ind) > 0:
+                    alpha_time_words = update_alpha_time_word(alpha_time_words, item, i, ind)
+    alpha_time_words = alpha_time_words.reshape(num_steps + 1, len(prompts) - 1, 1, 1, max_num_words)
+    return alpha_time_words
 
 
 # copied from diffusers.models.transformers.transformer_flux._get_projections
