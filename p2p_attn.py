@@ -70,6 +70,62 @@ def get_word_inds(text: str, target_word: Union[str, int], tokenizer) -> np.ndar
     return np.array(out)
 
 
+def get_replacement_mapper(x: str, y: str, tokenizer, max_len=512):
+    """
+    终极版：基于“补集思想”的无指针实现。
+    保证未替换部分（包含 BOS/EOS/Pad）形成严格的平移对角线 1-to-1 映射。
+    """
+    words_x, words_y = x.split(' '), y.split(' ')
+    if len(words_x) != len(words_y):
+        raise ValueError("Prompt A and B must have the same number of words for Replacement.")
+        
+    mapper = np.zeros((max_len, max_len))
+    
+    # 记录哪些 token 索引属于“被替换的词”，它们将被特殊处理
+    replaced_src_toks = set()
+    replaced_tgt_toks = set()
+    
+    # 1. 优先处理发生替换的单词区块
+    for word_idx, (w_x, w_y) in enumerate(zip(words_x, words_y)):
+        if w_x != w_y:
+            src_toks = get_word_inds(x, word_idx, tokenizer)
+            tgt_toks = get_word_inds(y, word_idx, tokenizer)
+            
+            # 过滤超长截断
+            src_toks = [t for t in src_toks if t < max_len]
+            tgt_toks = [t for t in tgt_toks if t < max_len]
+            
+            if src_toks and tgt_toks:
+                # 均分注意力权重
+                ratio = 1.0 / len(tgt_toks)
+                mapper[np.ix_(src_toks, tgt_toks)] = ratio
+                
+                # 将这些 token 索引加入“已消耗”集合
+                replaced_src_toks.update(src_toks)
+                replaced_tgt_toks.update(tgt_toks)
+
+    # 2. 处理剩余的所有 Token（未替换的词、BOS、EOS、Padding）
+    # 巧妙之处：提取出所有没被修改的 token 索引
+    unreplaced_src = [i for i in range(max_len) if i not in replaced_src_toks]
+    unreplaced_tgt = [i for i in range(max_len) if i not in replaced_tgt_toks]
+    
+    # 既然它们都没被修改，那它们绝对是一一对应的！直接拉链(zip)配对即可。
+    # 这会在矩阵上画出一条完美的、根据替换情况自动断开并平移的对角线 1.0
+    for s, t in zip(unreplaced_src, unreplaced_tgt):
+        mapper[s, t] = 1.0
+
+    return torch.from_numpy(mapper).float()
+
+def get_replacement_mapper_multi_prompts(prompts, tokenizer, max_len=512):
+    """对多个 prompt 进行 Replace 映射矩阵生成的包装函数"""
+    x_seq = prompts[0]
+    mappers = []
+    for i in range(1, len(prompts)):
+        # 逐个调用底层的 _ 函数
+        mapper = get_replacement_mapper(x_seq, prompts[i], tokenizer, max_len)
+        mappers.append(mapper)
+    return torch.stack(mappers) # 堆叠打包返回
+
 # copied from examples/community/pipeline_prompt2prompt.py
 def get_time_words_attention_alpha(
     prompts,
@@ -299,7 +355,11 @@ class AttentionStore(AttentionControl):
 
 class AttentionControlEdit(AttentionControl):
     @abc.abstractmethod
-    def replace_cross_attention(self, attn_base, att_replace):
+    def replace_p2l_attention(self, attn_base, att_replace):
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def replace_l2p_attention(self, attn_base, att_replace):
         raise NotImplementedError
 
     def on_attn_map(self, attn, is_single: bool, index):
@@ -309,17 +369,34 @@ class AttentionControlEdit(AttentionControl):
             heads = batch_heads // self.batch_size
             prompt_seq_len = 512
             latent_seq_len = seq_len - prompt_seq_len
-            prompt_to_latent_attn = attn[:, :prompt_seq_len, prompt_seq_len:]
-            # now the shape is (batch_size * heads, prompt_seq, latent_seq) softmaxed over latent_seq
-            assert prompt_to_latent_attn.shape == (self.batch_size * heads, prompt_seq_len, latent_seq_len)
 
-            attn_base, attn_replace = prompt_to_latent_attn[0], prompt_to_latent_attn[1:]
-            alpha = self.cross_replace_alpha[index] if self.cross_replace_alpha is not None else 1.0
-            attn_replace_new = self.replace_cross_attention(attn_base, attn_replace) * alpha + attn_replace * (1 - alpha)
-            attn[1:, :prompt_seq_len, prompt_seq_len:] = attn_replace_new
+            prompt_to_latent_attn = attn[:, :prompt_seq_len, prompt_seq_len:]
+            assert prompt_to_latent_attn.shape == (self.batch_size * heads, prompt_seq_len, latent_seq_len)
+            prompt_to_latent_attn = prompt_to_latent_attn.reshape(self.batch_size, heads, prompt_seq_len, latent_seq_len)
+            prompt_to_latent_attn = self.replace_p2l_attention(prompt_to_latent_attn[0], prompt_to_latent_attn[1:])
+            prompt_to_latent_attn = prompt_to_latent_attn.reshape(batch_heads, prompt_seq_len, latent_seq_len)
+            attn[:, :prompt_seq_len, prompt_seq_len:] = prompt_to_latent_attn
+
+            latent_to_prompt_attn = attn[:, prompt_seq_len:, :prompt_seq_len]
+            assert latent_to_prompt_attn.shape == (self.batch_size * heads, latent_seq_len, prompt_seq_len)
+            latent_to_prompt_attn = latent_to_prompt_attn.reshape(self.batch_size, heads, latent_seq_len, prompt_seq_len)
+            latent_to_prompt_attn = self.replace_l2p_attention(latent_to_prompt_attn[0], latent_to_prompt_attn[1:])
+            latent_to_prompt_attn = latent_to_prompt_attn.reshape(batch_heads, latent_seq_len, prompt_seq_len)
+            attn[:, prompt_seq_len:, :prompt_seq_len] = latent_to_prompt_attn
+
         return attn
 
     def __init__(self, prompts, pipeline, num_inference_steps):
         super().__init__(prompts, pipeline, num_inference_steps)
-        # TODO
-        self.cross_replace_alpha = None
+
+
+class AttentionReplace(AttentionControlEdit):
+    def replace_p2l_attention(self, attn_base, att_replace):
+        return torch.einsum('hpl,bpn->bhnl', attn_base, self.replacement_mapper)
+
+    def replace_l2p_attention(self, attn_base, att_replace):
+        return torch.einsum('hlp,bpn->bhln', attn_base, self.replacement_mapper)
+
+    def __init__(self, prompts, pipeline, num_inference_steps):
+        super().__init__(prompts, pipeline, num_inference_steps)
+        self.replacement_mapper = get_replacement_mapper_multi_prompts(prompts, pipeline.tokenizer).to('cuda')
