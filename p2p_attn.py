@@ -114,7 +114,7 @@ def get_replacement_mapper(x: str, y: str, tokenizer, max_len=512):
     for s, t in zip(unreplaced_src, unreplaced_tgt):
         mapper[s, t] = 1.0
 
-    return torch.from_numpy(mapper).float()
+    return torch.from_numpy(mapper).to(torch.bfloat16)
 
 def get_replacement_mapper_multi_prompts(prompts, tokenizer, max_len=512):
     """对多个 prompt 进行 Replace 映射矩阵生成的包装函数"""
@@ -363,26 +363,24 @@ class AttentionControlEdit(AttentionControl):
         raise NotImplementedError
 
     def on_attn_map(self, attn, is_single: bool, index):
-        if not is_single:
+        if True:
             batch_heads, seq_len, _ = attn.shape
             assert batch_heads % self.batch_size == 0, f'batch_heads {batch_heads} not divisible by batch_size {self.batch_size}'
             heads = batch_heads // self.batch_size
             prompt_seq_len = 512
             latent_seq_len = seq_len - prompt_seq_len
 
-            prompt_to_latent_attn = attn[:, :prompt_seq_len, prompt_seq_len:]
-            assert prompt_to_latent_attn.shape == (self.batch_size * heads, prompt_seq_len, latent_seq_len)
-            prompt_to_latent_attn = prompt_to_latent_attn.reshape(self.batch_size, heads, prompt_seq_len, latent_seq_len)
-            prompt_to_latent_attn = self.replace_p2l_attention(prompt_to_latent_attn[0], prompt_to_latent_attn[1:])
-            prompt_to_latent_attn = prompt_to_latent_attn.reshape(batch_heads, prompt_seq_len, latent_seq_len)
-            attn[:, :prompt_seq_len, prompt_seq_len:] = prompt_to_latent_attn
+            attn = attn.reshape(self.batch_size, heads, seq_len, seq_len)
 
-            latent_to_prompt_attn = attn[:, prompt_seq_len:, :prompt_seq_len]
-            assert latent_to_prompt_attn.shape == (self.batch_size * heads, latent_seq_len, prompt_seq_len)
-            latent_to_prompt_attn = latent_to_prompt_attn.reshape(self.batch_size, heads, latent_seq_len, prompt_seq_len)
+            prompt_to_latent_attn = attn[:, :, :prompt_seq_len, prompt_seq_len:]
+            prompt_to_latent_attn = self.replace_p2l_attention(prompt_to_latent_attn[0], prompt_to_latent_attn[1:])
+            attn[1:, :, :prompt_seq_len, prompt_seq_len:] = prompt_to_latent_attn
+
+            latent_to_prompt_attn = attn[:, :, prompt_seq_len:, :prompt_seq_len]
             latent_to_prompt_attn = self.replace_l2p_attention(latent_to_prompt_attn[0], latent_to_prompt_attn[1:])
-            latent_to_prompt_attn = latent_to_prompt_attn.reshape(batch_heads, latent_seq_len, prompt_seq_len)
-            attn[:, prompt_seq_len:, :prompt_seq_len] = latent_to_prompt_attn
+            attn[1:, :, prompt_seq_len:, :prompt_seq_len] = latent_to_prompt_attn
+
+            attn = attn.reshape(batch_heads, seq_len, seq_len)
 
         return attn
 
