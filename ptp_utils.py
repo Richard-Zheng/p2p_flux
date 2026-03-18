@@ -34,7 +34,7 @@ def text_under_image(image: np.ndarray, text: str, text_color: Tuple[int, int, i
     return img
 
 
-def view_images(images, num_rows=1, offset_ratio=0.02):
+def image_grid(images, num_rows=1, offset_ratio=0.02):
     if type(images) is list:
         num_empty = len(images) % num_rows
     elif images.ndim == 4:
@@ -58,6 +58,19 @@ def view_images(images, num_rows=1, offset_ratio=0.02):
                 i * num_cols + j]
 
     pil_img = Image.fromarray(image_)
-    display(pil_img)
+    return pil_img
 
+
+def cross_attention_img(attention_maps, tokens, decoder):
+    images = []
+    for i in range(len(tokens)):
+        #ipdb.set_trace()
+        image = attention_maps[i, :].reshape(64, 64)
+        image = 255 * image / image.max()
+        image = image.unsqueeze(-1).expand(*image.shape, 3)
+        image = image.numpy().astype(np.uint8)
+        image = np.array(Image.fromarray(image).resize((256, 256)))
+        image = text_under_image(image, decoder(int(tokens[i])))
+        images.append(image)
+    return image_grid(np.stack(images, axis=0))
 

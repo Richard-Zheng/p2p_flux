@@ -363,7 +363,7 @@ class AttentionControlEdit(AttentionControl):
         raise NotImplementedError
 
     def on_attn_map(self, attn, is_single: bool, index):
-        if True and self.cur_step < 10:
+        if self.cur_step < 3:
             batch_heads, seq_len, _ = attn.shape
             assert batch_heads % self.batch_size == 0, f'batch_heads {batch_heads} not divisible by batch_size {self.batch_size}'
             heads = batch_heads // self.batch_size
@@ -381,6 +381,27 @@ class AttentionControlEdit(AttentionControl):
             # attn[1:, :, prompt_seq_len:, :prompt_seq_len] = latent_to_prompt_attn
 
             attn[1, :, :, prompt_seq_len:] = attn[0, :, :, prompt_seq_len:]
+            attn[1, :, prompt_seq_len:, :prompt_seq_len] = attn[0, :, prompt_seq_len:, :prompt_seq_len]
+
+            attn = attn.reshape(batch_heads, seq_len, seq_len)
+        elif self.cur_step < 10:
+            batch_heads, seq_len, _ = attn.shape
+            assert batch_heads % self.batch_size == 0, f'batch_heads {batch_heads} not divisible by batch_size {self.batch_size}'
+            heads = batch_heads // self.batch_size
+            prompt_seq_len = 512
+            latent_seq_len = seq_len - prompt_seq_len
+
+            attn = attn.reshape(self.batch_size, heads, seq_len, seq_len)
+
+            # prompt_to_latent_attn = attn[:, :, :prompt_seq_len, prompt_seq_len:]
+            # prompt_to_latent_attn = self.replace_p2l_attention(prompt_to_latent_attn[0], prompt_to_latent_attn[1:])
+            # attn[1:, :, :prompt_seq_len, prompt_seq_len:] = prompt_to_latent_attn
+
+            # latent_to_prompt_attn = attn[:, :, prompt_seq_len:, :prompt_seq_len]
+            # latent_to_prompt_attn = self.replace_l2p_attention(latent_to_prompt_attn[0], latent_to_prompt_attn[1:])
+            # attn[1:, :, prompt_seq_len:, :prompt_seq_len] = latent_to_prompt_attn
+
+            attn[1, :, :prompt_seq_len, prompt_seq_len:] = attn[0, :, :prompt_seq_len, prompt_seq_len:]
             attn[1, :, prompt_seq_len:, :prompt_seq_len] = attn[0, :, prompt_seq_len:, :prompt_seq_len]
 
             attn = attn.reshape(batch_heads, seq_len, seq_len)
