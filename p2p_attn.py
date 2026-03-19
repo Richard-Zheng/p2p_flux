@@ -263,7 +263,7 @@ class P2PFluxAttnProcessor:
         )
 
         # one-liner
-        self.attn_map_callback(attention_probs)
+        attention_probs = self.attn_map_callback(attention_probs, hidden_states, encoder_hidden_states)
 
         hidden_states = torch.bmm(attention_probs, value)
         # hidden_states shape: (batch_size * heads, seq_len, head_dim)
@@ -289,16 +289,16 @@ class P2PFluxAttnProcessor:
 class AttentionControl(abc.ABC):
     def register_attention_control(self, pipe):
         for i, tblock in enumerate(pipe.transformer.transformer_blocks):
-            attn_map_callback = lambda probs, idx=i: self.on_attn_map(probs, is_single=False, index=idx)
+            attn_map_callback = lambda probs, hidden_states, encoder_hidden_states, idx=i: self.on_attn_map(probs, hidden_states, encoder_hidden_states, is_single=False, index=idx)
             attn_proc = P2PFluxAttnProcessor(attn_map_callback=attn_map_callback)
             tblock.attn.set_processor(attn_proc)
         for i, tblock in enumerate(pipe.transformer.single_transformer_blocks):
-            attn_map_callback = lambda probs, idx=i: self.on_attn_map(probs, is_single=True, index=idx)
+            attn_map_callback = lambda probs, hidden_states, encoder_hidden_states, idx=i: self.on_attn_map(probs, hidden_states, encoder_hidden_states, is_single=True, index=idx)
             attn_proc = P2PFluxAttnProcessor(attn_map_callback=attn_map_callback)
             tblock.attn.set_processor(attn_proc)
 
     @abc.abstractmethod
-    def on_attn_map(self, attn, is_single: bool, index):
+    def on_attn_map(self, attn, hidden_states, encoder_hidden_states, is_single: bool, index):
         raise NotImplementedError
 
     def __init__(self, prompts, pipeline, num_inference_steps):
@@ -309,7 +309,7 @@ class AttentionControl(abc.ABC):
 
 
 class EmptyControl(AttentionControl):
-    def on_attn_map(self, attn, is_single: bool, index):
+    def on_attn_map(self, attn, hidden_states, encoder_hidden_states, is_single: bool, index):
         if is_single:
             print(f'single attn[{index}] processed, total {len(self.pipeline.transformer.single_transformer_blocks)}')
         else:
@@ -317,8 +317,8 @@ class EmptyControl(AttentionControl):
         return attn
 
 
-class AttentionStore(AttentionControl):
-    def on_attn_map(self, attn, is_single: bool, index):
+class P2LAttentionStore(AttentionControl):
+    def on_attn_map(self, attn, hidden_states, encoder_hidden_states, is_single: bool, index):
         if not is_single:
             # attn shape: (batch_size * heads, prompt_seq+latent_seq, prompt_seq+latent_seq)
             # first we verify every line sums to 1
@@ -330,7 +330,7 @@ class AttentionStore(AttentionControl):
             batch_heads, seq_len, _ = attn.shape
             assert batch_heads % self.batch_size == 0, f'batch_heads {batch_heads} not divisible by batch_size {self.batch_size}'
             heads = batch_heads // self.batch_size
-            prompt_seq_len = 512
+            prompt_seq_len = encoder_hidden_states.shape[1] if encoder_hidden_states is not None else 512
             latent_seq_len = seq_len - prompt_seq_len
             prompt_to_latent_attn = attn[:, :prompt_seq_len, prompt_seq_len:]
             # now the shape is (batch_size * heads, prompt_seq, latent_seq) softmaxed over latent_seq
@@ -353,6 +353,37 @@ class AttentionStore(AttentionControl):
         self.attention_store = None
 
 
+class L2LAttentionStore(AttentionControl):
+    def on_attn_map(self, attn, hidden_states, encoder_hidden_states, is_single: bool, index):
+        if not is_single:
+            # attn shape: (batch_size * heads, prompt_seq+latent_seq, prompt_seq+latent_seq)
+            # first we verify every line sums to 1
+            assert torch.allclose(attn.sum(dim=-1), torch.ones_like(attn.sum(dim=-1)), rtol=0.01), f'Attention map rows sums to {attn.sum(dim=-1)}'
+
+            batch_heads, seq_len, _ = attn.shape
+            assert batch_heads % self.batch_size == 0, f'batch_heads {batch_heads} not divisible by batch_size {self.batch_size}'
+            heads = batch_heads // self.batch_size
+            prompt_seq_len = encoder_hidden_states.shape[1] if encoder_hidden_states is not None else 512
+            latent_seq_len = seq_len - prompt_seq_len
+            l2l_attn = attn[:, prompt_seq_len:, prompt_seq_len:]
+            assert l2l_attn.shape == (self.batch_size * heads, latent_seq_len, latent_seq_len)
+            l2l_attn = l2l_attn.reshape(self.batch_size, heads, latent_seq_len, latent_seq_len)
+            # sum over heads
+            l2l_attn = l2l_attn.sum(dim=1) / len(self.pipeline.transformer.transformer_blocks) / self.num_inference_steps
+
+            # now add to step_store, take average over num_att_layers
+            if self.attention_store is None:
+                self.attention_store = l2l_attn
+            else:
+                self.attention_store += l2l_attn
+            del l2l_attn
+        return attn
+    
+    def __init__(self, prompts, pipeline, num_inference_steps):
+        super().__init__(prompts, pipeline, num_inference_steps)
+        self.attention_store = None
+
+
 class AttentionControlEdit(AttentionControl):
     @abc.abstractmethod
     def replace_p2l_attention(self, attn_base, att_replace):
@@ -362,12 +393,12 @@ class AttentionControlEdit(AttentionControl):
     def replace_l2p_attention(self, attn_base, att_replace):
         raise NotImplementedError
 
-    def on_attn_map(self, attn, is_single: bool, index):
+    def on_attn_map(self, attn, hidden_states, encoder_hidden_states, is_single: bool, index):
         if True and self.cur_step < 10:
             batch_heads, seq_len, _ = attn.shape
             assert batch_heads % self.batch_size == 0, f'batch_heads {batch_heads} not divisible by batch_size {self.batch_size}'
             heads = batch_heads // self.batch_size
-            prompt_seq_len = 512
+            prompt_seq_len = encoder_hidden_states.shape[1] if encoder_hidden_states is not None else 512
             latent_seq_len = seq_len - prompt_seq_len
 
             attn = attn.reshape(self.batch_size, heads, seq_len, seq_len)
