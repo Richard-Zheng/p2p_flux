@@ -104,8 +104,8 @@ loaded_attention_store = torch.load("controller_attention_store.pt", weights_onl
 visualize_flux_icl_attention(
     original_image_path="flux-fill-dev.png",
     attention_store=loaded_attention_store, # 确保传入正确的属性
-    target_height=1632,  # 传入你 Pipeline 中设置的 height
-    target_width=1232,   # 传入你 Pipeline 中设置的 width
+    target_height=1024,  # 传入你 Pipeline 中设置的 height
+    target_width=960,   # 传入你 Pipeline 中设置的 width
     batch_idx=0,
     step=16
 )
