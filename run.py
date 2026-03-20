@@ -26,7 +26,7 @@ image = pipe(
     guidance_scale=30,
     num_inference_steps=num_inference_steps,
     max_sequence_length=512,
-    generator=torch.Generator("cpu").manual_seed(0)
+    generator=torch.Generator("cpu").manual_seed(42)
 ).images[0]
 image.save(f"flux-fill-dev.png")
 
