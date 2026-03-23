@@ -51,8 +51,41 @@ def prepare_batch_icl_inputs(a_path, aa_path, b_path, target_size=(512, 512)):
 
     return images, masks
 
+def prepare_2x2_icl_inputs(a_path, aa_path, b_path, target_size=(512, 512)):
+    """
+    为 FLUX.1-Fill 准备 2x2 四方格的 In-Context Learning 输入。
+    """
+    w, h = target_size
+    grid_w, grid_h = w * 2, h * 2
+
+    # 1. 加载图像
+    img_A = Image.open(a_path).convert("RGB").resize(target_size)
+    img_A_prime = Image.open(aa_path).convert("RGB").resize(target_size)
+    img_B = Image.open(b_path).convert("RGB").resize(target_size)
+
+    # 2. 构建 Image Grid
+    # [ A (左上) | A' (右上) ]
+    # [ B (左下) | B' (右下, 用 B 垫底以稳固结构) ]
+    image_grid = Image.new("RGB", (grid_w, grid_h))
+    image_grid.paste(img_A, (0, 0))              
+    image_grid.paste(img_A_prime, (w, 0))        
+    image_grid.paste(img_B, (0, h))              
+    image_grid.paste(img_B, (w, h))              
+
+    # 3. 构建 Mask Grid
+    # 前三个象限全黑 (0)，只有右下角 B' 为纯白 (255)
+    mask_grid = Image.new("L", (grid_w, grid_h), 0)
+    draw = ImageDraw.Draw(mask_grid)
+    draw.rectangle([w, h, grid_w, grid_h], fill=255)
+
+    # 保存预览
+    image_grid.save("grid_image.png")
+    mask_grid.save("grid_mask.png")
+
+    return image_grid, mask_grid
+
 # 使用示例：
-image, mask = prepare_batch_icl_inputs("a.png", "aa.png", "b.png")
+image, mask = prepare_2x2_icl_inputs("a.png", "aa.png", "b.png")
 # pipeline(prompt="", image=images, mask_image=masks, ...)
 
 import torch
@@ -66,20 +99,19 @@ pipe.enable_sequential_cpu_offload()
 
 num_inference_steps = 50
 prompt=[
-"In the masked region on the right, generate the exact same oil painting scene, but replace the three red apples with three oranges. Strictly preserve the original oil painting style, the lighting, the plate, the blue patterned cloth, and all other background details perfectly."
-]*2
-mod_attn.register_attention_control(pipe, mod_attn.FeatureAlignFluxAttnProcessor, prompt)
+"In the masked region on the bottom-right, generate the exact same oil painting scene, but replace the three red apples with three oranges. Strictly preserve the original oil painting style, the lighting, the plate, the blue patterned cloth, and all other background details perfectly."
+]
+mod_attn.register_attention_control(pipe, mod_attn.SACFluxAttnProcessor, prompt)
 
 image = pipe(
     prompt=prompt,
     image=image,
     mask_image=mask,
     width=1024,
-    height=512,
+    height=1024,
     guidance_scale=30,
     num_inference_steps=num_inference_steps,
     max_sequence_length=512,
     generator=torch.Generator("cpu").manual_seed(42)
 ).images
-image[0].save(f"out0.png")
-image[1].save(f"out1.png")
+image[0].save(f"out.png")
