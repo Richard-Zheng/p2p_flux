@@ -68,7 +68,7 @@ num_inference_steps = 50
 prompt=[
 "In the masked region on the right, generate the exact same oil painting scene, but replace the three red apples with three oranges. Strictly preserve the original oil painting style, the lighting, the plate, the blue patterned cloth, and all other background details perfectly."
 ]*2
-mod_attn.register_attention_control(pipe, mod_attn.TwoBatchFluxAttnProcessor, prompt)
+mod_attn.register_attention_control(pipe, mod_attn.FeatureAlignFluxAttnProcessor, prompt)
 
 image = pipe(
     prompt=prompt,
