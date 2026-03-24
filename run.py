@@ -89,10 +89,11 @@ image, mask = prepare_2x2_icl_inputs("a.png", "aa.png", "b.png")
 # pipeline(prompt="", image=images, mask_image=masks, ...)
 
 import torch
+import torchvision.transforms as T
 import numpy as np
 from diffusers import FluxFillPipeline
 from diffusers.utils import load_image
-import mod_attn
+from attn_proc.sac import SACFluxAttnProcessor
 
 pipe = FluxFillPipeline.from_pretrained("/home/frain/Documents/FLUX.1-Fill", torch_dtype=torch.bfloat16)
 pipe.enable_sequential_cpu_offload()
@@ -104,7 +105,7 @@ prompt=[
 out_width = 1024
 out_height = 1024
 
-attn_processor = mod_attn.SACFluxAttnProcessor(pipe, prompt, out_width, out_height)
+attn_processor = SACFluxAttnProcessor(pipe, prompt, out_width, out_height)
 
 image = pipe(
     prompt=prompt,
@@ -119,8 +120,9 @@ image = pipe(
 ).images
 
 image[0].save(f"out.png")
+to_tensor = T.ToTensor()
 save_dict = {
-    "image": image,
+    "image": torch.stack([to_tensor(img) for img in image]),
     "attention_map": attn_processor.attention_store,
     "out_width": out_width,
     "out_height": out_height,
