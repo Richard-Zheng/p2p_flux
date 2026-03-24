@@ -5,12 +5,12 @@ import itertools
 import torch
 from diffusers.models.transformers.transformer_flux import FluxAttention
 from diffusers.models.embeddings import apply_rotary_emb
-from enum import Enum
+from enum import IntEnum
 
 
-class TransType(Enum):
-    SINGLE = 0
-    DOUBLE = 1
+class TransType(IntEnum):
+    DOUBLE = 0
+    SINGLE = 1
 
 
 # copied from diffusers.models.transformers.transformer_flux._get_projections
@@ -50,25 +50,18 @@ class VanilliaFluxAttnProcessor:
     _attention_backend = None
     _parallel_config = None
 
-    def __init__(self, type, pipe, prompt):
+    def __init__(self, pipe, prompt):
         super().__init__()
-        self.type = type
         self.pipe = pipe
         self.prompt = prompt
-        if type == TransType.DOUBLE:
-            self.num_blocks = len(pipe.transformer.transformer_blocks)
-        elif type == TransType.SINGLE:
-            self.num_blocks = len(pipe.transformer.single_transformer_blocks)
-        self.block_idx = 0
+        self.block_idx = [0, 0]
         self.step_idx = 0
         self.batch_size = len(prompt)
 
-    def after_call(self):
-        print(f"完成第 {self.step_idx} 步，第 {self.block_idx} 个 {self.type.name} 块的注意力计算。")
-        self.block_idx += 1
-        if self.block_idx >= self.num_blocks:
-            self.block_idx = 0
-            self.step_idx += 1
+        for i, tblock in enumerate(pipe.transformer.transformer_blocks):
+            tblock.attn.set_processor(self)
+        for i, tblock in enumerate(pipe.transformer.single_transformer_blocks):
+            tblock.attn.set_processor(self)
 
     def __call__(
         self,
@@ -78,6 +71,12 @@ class VanilliaFluxAttnProcessor:
         attention_mask: Optional[torch.Tensor] = None,
         image_rotary_emb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        trans_type = TransType.SINGLE if encoder_hidden_states is None else TransType.DOUBLE
+        if trans_type == TransType.DOUBLE:
+            num_blocks = len(self.pipe.transformer.transformer_blocks)
+        elif trans_type == TransType.SINGLE:
+            num_blocks = len(self.pipe.transformer.single_transformer_blocks)
+
         query, key, value, encoder_query, encoder_key, encoder_value = _get_qkv_projections(
             attn, hidden_states, encoder_hidden_states
         )
@@ -134,6 +133,7 @@ class VanilliaFluxAttnProcessor:
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
 
+        ret = None
         if encoder_hidden_states is not None:
             encoder_hidden_states, hidden_states = hidden_states.split_with_sizes(
                 [encoder_hidden_states.shape[1], hidden_states.shape[1] - encoder_hidden_states.shape[1]], dim=1
@@ -143,34 +143,34 @@ class VanilliaFluxAttnProcessor:
             encoder_hidden_states = attn.to_add_out(encoder_hidden_states)
 
             self.after_call()
-            return hidden_states, encoder_hidden_states
+            ret = hidden_states, encoder_hidden_states
         else:
-            self.after_call()
-            return hidden_states
+            ret = hidden_states
+
+        print(f"完成第 {self.step_idx} 步，第 {self.block_idx[trans_type]} 个 {trans_type.name} 块的注意力计算。")
+        self.block_idx[trans_type] += 1
+        if trans_type is TransType.SINGLE and self.block_idx[trans_type] >= num_blocks:
+            self.block_idx = [0, 0]
+            self.step_idx += 1
+        return ret
 
 
 class TwoBatchFluxAttnProcessor:
     _attention_backend = None
     _parallel_config = None
 
-    def __init__(self, type, pipe, prompt):
+    def __init__(self, pipe, prompt):
         super().__init__()
-        self.type = type
         self.pipe = pipe
         self.prompt = prompt
-        if type == TransType.DOUBLE:
-            self.num_blocks = len(pipe.transformer.transformer_blocks)
-        elif type == TransType.SINGLE:
-            self.num_blocks = len(pipe.transformer.single_transformer_blocks)
-        self.block_idx = 0
+        self.block_idx = [0, 0]
         self.step_idx = 0
         self.batch_size = len(prompt)
-    
-    def after_call(self):
-        self.block_idx += 1
-        if self.block_idx >= self.num_blocks:
-            self.block_idx = 0
-            self.step_idx += 1
+
+        for i, tblock in enumerate(pipe.transformer.transformer_blocks):
+            tblock.attn.set_processor(self)
+        for i, tblock in enumerate(pipe.transformer.single_transformer_blocks):
+            tblock.attn.set_processor(self)
 
     def __call__(
         self,
@@ -180,6 +180,12 @@ class TwoBatchFluxAttnProcessor:
         attention_mask: Optional[torch.Tensor] = None,
         image_rotary_emb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        trans_type = TransType.SINGLE if encoder_hidden_states is None else TransType.DOUBLE
+        if trans_type == TransType.DOUBLE:
+            num_blocks = len(self.pipe.transformer.transformer_blocks)
+        elif trans_type == TransType.SINGLE:
+            num_blocks = len(self.pipe.transformer.single_transformer_blocks)
+
         query, key, value, encoder_query, encoder_key, encoder_value = _get_qkv_projections(
             attn, hidden_states, encoder_hidden_states
         )
@@ -278,6 +284,7 @@ class TwoBatchFluxAttnProcessor:
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
 
+        ret = None
         if encoder_hidden_states is not None:
             encoder_hidden_states, hidden_states = hidden_states.split_with_sizes(
                 [encoder_hidden_states.shape[1], hidden_states.shape[1] - encoder_hidden_states.shape[1]], dim=1
@@ -287,34 +294,34 @@ class TwoBatchFluxAttnProcessor:
             encoder_hidden_states = attn.to_add_out(encoder_hidden_states)
 
             self.after_call()
-            return hidden_states, encoder_hidden_states
+            ret = hidden_states, encoder_hidden_states
         else:
-            self.after_call()
-            return hidden_states
+            ret = hidden_states
+
+        print(f"完成第 {self.step_idx} 步，第 {self.block_idx[trans_type]} 个 {trans_type.name} 块的注意力计算。")
+        self.block_idx[trans_type] += 1
+        if trans_type is TransType.SINGLE and self.block_idx[trans_type] >= num_blocks:
+            self.block_idx = [0, 0]
+            self.step_idx += 1
+        return ret
 
 
 class FeatureAlignFluxAttnProcessor:
     _attention_backend = None
     _parallel_config = None
 
-    def __init__(self, type, pipe, prompt):
+    def __init__(self, pipe, prompt):
         super().__init__()
-        self.type = type
         self.pipe = pipe
         self.prompt = prompt
-        if type == TransType.DOUBLE:
-            self.num_blocks = len(pipe.transformer.transformer_blocks)
-        elif type == TransType.SINGLE:
-            self.num_blocks = len(pipe.transformer.single_transformer_blocks)
-        self.block_idx = 0
+        self.block_idx = [0, 0]
         self.step_idx = 0
         self.batch_size = len(prompt)
 
-    def after_call(self):
-        self.block_idx += 1
-        if self.block_idx >= self.num_blocks:
-            self.block_idx = 0
-            self.step_idx += 1
+        for i, tblock in enumerate(pipe.transformer.transformer_blocks):
+            tblock.attn.set_processor(self)
+        for i, tblock in enumerate(pipe.transformer.single_transformer_blocks):
+            tblock.attn.set_processor(self)
 
     def __call__(
         self,
@@ -324,6 +331,12 @@ class FeatureAlignFluxAttnProcessor:
         attention_mask: Optional[torch.Tensor] = None,
         image_rotary_emb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        trans_type = TransType.SINGLE if encoder_hidden_states is None else TransType.DOUBLE
+        if trans_type == TransType.DOUBLE:
+            num_blocks = len(self.pipe.transformer.transformer_blocks)
+        elif trans_type == TransType.SINGLE:
+            num_blocks = len(self.pipe.transformer.single_transformer_blocks)
+
         query, key, value, encoder_query, encoder_key, encoder_value = _get_qkv_projections(
             attn, hidden_states, encoder_hidden_states
         )
@@ -441,6 +454,7 @@ class FeatureAlignFluxAttnProcessor:
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
 
+        ret = None
         if encoder_hidden_states is not None:
             encoder_hidden_states, hidden_states = hidden_states.split_with_sizes(
                 [encoder_hidden_states.shape[1], hidden_states.shape[1] - encoder_hidden_states.shape[1]], dim=1
@@ -450,35 +464,38 @@ class FeatureAlignFluxAttnProcessor:
             encoder_hidden_states = attn.to_add_out(encoder_hidden_states)
 
             self.after_call()
-            return hidden_states, encoder_hidden_states
+            ret = hidden_states, encoder_hidden_states
         else:
-            self.after_call()
-            return hidden_states
+            ret = hidden_states
+
+        print(f"完成第 {self.step_idx} 步，第 {self.block_idx[trans_type]} 个 {trans_type.name} 块的注意力计算。")
+        self.block_idx[trans_type] += 1
+        if trans_type is TransType.SINGLE and self.block_idx[trans_type] >= num_blocks:
+            self.block_idx = [0, 0]
+            self.step_idx += 1
+        return ret
 
 
 class SACFluxAttnProcessor:
     _attention_backend = None
     _parallel_config = None
 
-    def __init__(self, type, pipe, prompt):
+    def __init__(self, pipe, prompt, out_width, out_height):
         super().__init__()
-        self.type = type
         self.pipe = pipe
         self.prompt = prompt
-        if type == TransType.DOUBLE:
-            self.num_blocks = len(pipe.transformer.transformer_blocks)
-        elif type == TransType.SINGLE:
-            self.num_blocks = len(pipe.transformer.single_transformer_blocks)
-        self.block_idx = 0
+        self.block_idx = [0, 0]
         self.step_idx = 0
         self.batch_size = len(prompt)
+        self.out_width = out_width
+        self.out_height = out_height
 
-    def after_call(self):
-        print(f"完成第 {self.step_idx} 步，第 {self.block_idx} 个 {self.type.name} 块的注意力计算。")
-        self.block_idx += 1
-        if self.block_idx >= self.num_blocks:
-            self.block_idx = 0
-            self.step_idx += 1
+        for i, tblock in enumerate(pipe.transformer.transformer_blocks):
+            tblock.attn.set_processor(self)
+        for i, tblock in enumerate(pipe.transformer.single_transformer_blocks):
+            tblock.attn.set_processor(self)
+        self.attention_store = None
+        self.num_text = None
 
     def __call__(
         self,
@@ -488,6 +505,12 @@ class SACFluxAttnProcessor:
         attention_mask: Optional[torch.Tensor] = None,
         image_rotary_emb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        trans_type = TransType.SINGLE if encoder_hidden_states is None else TransType.DOUBLE
+        if trans_type == TransType.DOUBLE:
+            num_blocks = len(self.pipe.transformer.transformer_blocks)
+        elif trans_type == TransType.SINGLE:
+            num_blocks = len(self.pipe.transformer.single_transformer_blocks)
+
         query, key, value, encoder_query, encoder_key, encoder_value = _get_qkv_projections(
             attn, hidden_states, encoder_hidden_states
         )
@@ -534,13 +557,15 @@ class SACFluxAttnProcessor:
             import math
             
             # 🔥 修复：动态计算文本 Token 数量
-            if self.type == TransType.DOUBLE:
+            if self.num_text is None and trans_type == TransType.DOUBLE:
                 # Double 块：文本和图像分开
-                num_txt = encoder_hidden_states.shape[1] if encoder_hidden_states is not None else 0
+                num_txt = encoder_hidden_states.shape[1]
+                self.num_text = encoder_hidden_states.shape[1]
             else:
                 # Single 块：文本和图像已经拼接在 query 里了
                 # 图像长度固定为 4096 (1024x1024 打包后)，多出来的都是文本
-                num_txt = seq_len - 4096 
+                num_txt = self.num_text
+            assert self.num_text is not None
 
             S_img = seq_len - num_txt # 确保 S_img 永远是 4096
             
@@ -562,27 +587,27 @@ class SACFluxAttnProcessor:
             max_native_b_prime_to_a_prime = native_b_prime_to_a_prime.amax(dim=-1, keepdim=True)
             max_b_to_a = clone_b_to_a.amax(dim=-1, keepdim=True)
             # 🌟 动态对齐 (Logit Alignment)
-            tau = 2.0
+            tau = 1.6
             aligned_b_prime_to_a_prime = clone_b_to_a - max_b_to_a + max_native_b_prime_to_a_prime + tau
             img_sim[:, mid:, mid:, :mid, mid:] = aligned_b_prime_to_a_prime
 
             # 动作 2: 阻断旧语义源 (防止画出红苹果)
             # 严禁 B' 看 A (左上的原苹果)，逼迫它只能顺着动作1去 A' 吸取橘子特征
-            img_sim[:, mid:, mid:, :mid, :mid] = -10000.0
+            # img_sim[:, mid:, mid:, :mid, :mid] = -10000.0
 
             # 动作 3: B'结构需要和B一致
             # 直接把 B -> B 的分数克隆到 B' -> B 上，确保它们的结构感完全一致！
             # 但是 RoPE 导致的空间错位让它们的注意力分数大小不在同一水平，必须动态对齐一下才能安全克隆！
-            clone_b_to_b = img_sim[:, mid:, :mid, mid:, :mid].clone()
-            native_b_prime_to_b = img_sim[:, mid:, mid:, mid:, :mid].clone()
-            max_native_b_prime_to_b = native_b_prime_to_b.amax(dim=-1, keepdim=True)
-            max_b_to_b = clone_b_to_b.amax(dim=-1, keepdim=True)
-            # 🌟 动态对齐 (Logit Alignment)
-            # 将干净分数的峰值，强行平移到原生噪声分数的峰值水平
-            # tau = 0.0 表示 1:1 绝对公平竞争；tau = 1.0 表示让克隆特征有 e^1 倍的优势
-            tau = 1.0
-            aligned_b_to_b = clone_b_to_b - max_b_to_b + max_native_b_prime_to_b + tau
-            img_sim[:, mid:, mid:, mid:, :mid] = aligned_b_to_b
+            # clone_b_to_b = img_sim[:, mid:, :mid, mid:, :mid].clone()
+            # native_b_prime_to_b = img_sim[:, mid:, mid:, mid:, :mid].clone()
+            # max_native_b_prime_to_b = native_b_prime_to_b.amax(dim=-1, keepdim=True)
+            # max_b_to_b = clone_b_to_b.amax(dim=-1, keepdim=True)
+            # # 🌟 动态对齐 (Logit Alignment)
+            # # 将干净分数的峰值，强行平移到原生噪声分数的峰值水平
+            # # tau = 0.0 表示 1:1 绝对公平竞争；tau = 1.0 表示让克隆特征有 e^1 倍的优势
+            # tau = 1.0
+            # aligned_b_to_b = clone_b_to_b - max_b_to_b + max_native_b_prime_to_b + tau
+            # img_sim[:, mid:, mid:, mid:, :mid] = aligned_b_to_b
 
             # ⚠️ 极其关键的修复：什么都不做！
             # 绝对不要动 B' -> B'：让它自己平滑噪声，生成完美的油画笔触！
@@ -600,6 +625,26 @@ class SACFluxAttnProcessor:
 
         # Softmax 会自动处理我们塞进去的 -10000.0，使其概率归零
         attention_probs = sim.softmax(dim=-1)
+
+        # =====================================================================
+        # 🌟 Store Image-to-Image Attention Maps
+        # =====================================================================
+        # Extract L2L part, shape: (batch_size * heads, S_img, S_img)
+        l2l_attn = attention_probs[:, self.num_text:, self.num_text:]
+        
+        # Reshape to separate batch and heads: (batch_size, heads, S_img, S_img)
+        # l2l_attn = l2l_attn.reshape(self.batch_size, heads, S_img, S_img)
+        
+        # Average across all heads to reduce memory: (batch_size, S_img, S_img)
+        l2l_attn = l2l_attn.mean(dim=0)
+        
+        # Accumulate the attention maps
+        if self.attention_store is None:
+            self.attention_store = l2l_attn
+        else:
+            self.attention_store += l2l_attn
+        # =====================================================================
+
         hidden_states = torch.bmm(attention_probs, value)
         
         # ... 后面的维度还原代码保持原样 ...
@@ -607,6 +652,7 @@ class SACFluxAttnProcessor:
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
 
+        ret = None
         if encoder_hidden_states is not None:
             encoder_hidden_states, hidden_states = hidden_states.split_with_sizes(
                 [encoder_hidden_states.shape[1], hidden_states.shape[1] - encoder_hidden_states.shape[1]], dim=1
@@ -615,16 +661,13 @@ class SACFluxAttnProcessor:
             hidden_states = attn.to_out[1](hidden_states)
             encoder_hidden_states = attn.to_add_out(encoder_hidden_states)
 
-            self.after_call()
-            return hidden_states, encoder_hidden_states
+            ret = hidden_states, encoder_hidden_states
         else:
-            self.after_call()
-            return hidden_states
+            ret = hidden_states
 
-def register_attention_control(pipe, attn_processor, prompt):
-    double_attn_proc = attn_processor(type=TransType.DOUBLE, pipe=pipe, prompt=prompt)
-    single_attn_proc = attn_processor(type=TransType.SINGLE, pipe=pipe, prompt=prompt)
-    for i, tblock in enumerate(pipe.transformer.transformer_blocks):
-        tblock.attn.set_processor(double_attn_proc)
-    for i, tblock in enumerate(pipe.transformer.single_transformer_blocks):
-        tblock.attn.set_processor(single_attn_proc)
+        print(f"完成第 {self.step_idx} 步，第 {self.block_idx[trans_type]} 个 {trans_type.name} 块的注意力计算。")
+        self.block_idx[trans_type] += 1
+        if trans_type is TransType.SINGLE and self.block_idx[trans_type] >= num_blocks:
+            self.block_idx = [0, 0]
+            self.step_idx += 1
+        return ret

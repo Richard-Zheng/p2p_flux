@@ -101,17 +101,28 @@ num_inference_steps = 50
 prompt=[
 "In the masked region on the bottom-right, generate the exact same oil painting scene, but replace the three red apples with three oranges. Strictly preserve the original oil painting style, the lighting, the plate, the blue patterned cloth, and all other background details perfectly."
 ]
-mod_attn.register_attention_control(pipe, mod_attn.SACFluxAttnProcessor, prompt)
+out_width = 1024
+out_height = 1024
+
+attn_processor = mod_attn.SACFluxAttnProcessor(pipe, prompt, out_width, out_height)
 
 image = pipe(
     prompt=prompt,
     image=image,
     mask_image=mask,
-    width=1024,
-    height=1024,
+    width=out_width,
+    height=out_height,
     guidance_scale=30,
     num_inference_steps=num_inference_steps,
     max_sequence_length=512,
     generator=torch.Generator("cpu").manual_seed(42)
 ).images
+
 image[0].save(f"out.png")
+save_dict = {
+    "image": image,
+    "attention_map": attn_processor.attention_store,
+    "out_width": out_width,
+    "out_height": out_height,
+}
+torch.save(save_dict, "controller_attention_store.pt")
