@@ -93,6 +93,7 @@ import torchvision.transforms as T
 import numpy as np
 from diffusers import FluxFillPipeline
 from diffusers.utils import load_image
+from attn_proc.vanillia import VanilliaFluxAttnProcessor
 from attn_proc.sac import SACFluxAttnProcessor
 
 pipe = FluxFillPipeline.from_pretrained("/home/frain/Documents/FLUX.1-Fill", torch_dtype=torch.bfloat16)
@@ -105,7 +106,7 @@ prompt=[
 out_width = 1024
 out_height = 1024
 
-attn_processor = SACFluxAttnProcessor(pipe, prompt, out_width, out_height)
+attn_processor = VanilliaFluxAttnProcessor(pipe, prompt, out_width, out_height)
 
 image = pipe(
     prompt=prompt,
@@ -116,7 +117,7 @@ image = pipe(
     guidance_scale=30,
     num_inference_steps=num_inference_steps,
     max_sequence_length=512,
-    generator=torch.Generator("cpu").manual_seed(42)
+    generator=torch.Generator("cpu").manual_seed(0)
 ).images
 
 image[0].save(f"out.png")

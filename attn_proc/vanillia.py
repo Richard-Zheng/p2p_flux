@@ -65,6 +65,10 @@ class VanilliaFluxAttnProcessor:
             tblock.attn.set_processor(self)
         for i, tblock in enumerate(pipe.transformer.single_transformer_blocks):
             tblock.attn.set_processor(self)
+        self.attention_store = None
+        self.seq_len = None
+        self.text_seq_len = None
+        self.latent_seq_len = None
 
     def __call__(
         self,
@@ -79,6 +83,10 @@ class VanilliaFluxAttnProcessor:
             num_blocks = len(self.pipe.transformer.transformer_blocks)
         elif block_type == TransType.SINGLE:
             num_blocks = len(self.pipe.transformer.single_transformer_blocks)
+        if self.text_seq_len is None and block_type == TransType.DOUBLE:
+            self.text_seq_len = encoder_hidden_states.shape[1]
+            self.latent_seq_len = hidden_states.shape[1]
+            self.seq_len = self.text_seq_len + self.latent_seq_len
 
         query, key, value, encoder_query, encoder_key, encoder_value = _get_qkv_projections(
             attn, hidden_states, encoder_hidden_states
@@ -110,6 +118,7 @@ class VanilliaFluxAttnProcessor:
         # q k v shape: (batch_size, seq_len, heads, head_dim) [1, 4608, 24, 128]
         # to use attn.get_attention_scores() we need to reshape to (batch_size * heads, seq_len, head_dim)
         batch_size, seq_len, heads, head_dim = query.shape
+        assert seq_len == self.seq_len
         query = query.permute(0, 2, 1, 3).reshape(-1, query.shape[1], query.shape[3])
         key = key.permute(0, 2, 1, 3).reshape(-1, key.shape[1], key.shape[3])
         value = value.permute(0, 2, 1, 3).reshape(-1, value.shape[1], value.shape[3])
@@ -127,6 +136,25 @@ class VanilliaFluxAttnProcessor:
             key,
             attention_mask=attention_mask,
         )
+
+        # =====================================================================
+        # 🌟 Store Image-to-Image Attention Maps
+        # =====================================================================
+        # Extract L2L part, shape: (batch_size * heads, S_img, S_img)
+        l2l_attn = attention_probs[:, self.text_seq_len:, self.text_seq_len:]
+
+        # Reshape to separate batch and heads: (batch_size, heads, S_img, S_img)
+        l2l_attn = l2l_attn.view(self.batch_size, -1, self.latent_seq_len, self.latent_seq_len)
+        
+        # Average across all heads to reduce memory: (batch_size, S_img, S_img)
+        l2l_attn_avg = l2l_attn.mean(dim=1)
+        
+        # Accumulate the attention maps
+        if self.attention_store is None:
+            self.attention_store = l2l_attn_avg
+        else:
+            self.attention_store += l2l_attn_avg
+        # =====================================================================
 
         hidden_states = torch.bmm(attention_probs, value)
         # hidden_states shape: (batch_size * heads, seq_len, head_dim)
@@ -149,7 +177,6 @@ class VanilliaFluxAttnProcessor:
         else:
             ret = hidden_states
 
-        print(f"完成第 {self.step_idx} 步，第 {self.block_idx[block_type]} 个 {block_type.name} 块的注意力计算。")
         self.block_idx[block_type] += 1
         if block_type is TransType.SINGLE and self.block_idx[block_type] >= num_blocks:
             self.block_idx = [0, 0]

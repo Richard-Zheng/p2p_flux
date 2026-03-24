@@ -66,7 +66,9 @@ class SACFluxAttnProcessor:
         for i, tblock in enumerate(pipe.transformer.single_transformer_blocks):
             tblock.attn.set_processor(self)
         self.attention_store = None
-        self.num_text = None
+        self.seq_len = None
+        self.text_seq_len = None
+        self.latent_seq_len = None
 
     def __call__(
         self,
@@ -81,6 +83,10 @@ class SACFluxAttnProcessor:
             num_blocks = len(self.pipe.transformer.transformer_blocks)
         elif block_type == TransType.SINGLE:
             num_blocks = len(self.pipe.transformer.single_transformer_blocks)
+        if self.text_seq_len is None and block_type == TransType.DOUBLE:
+            self.text_seq_len = encoder_hidden_states.shape[1]
+            self.latent_seq_len = hidden_states.shape[1]
+            self.seq_len = self.text_seq_len + self.latent_seq_len
 
         query, key, value, encoder_query, encoder_key, encoder_value = _get_qkv_projections(
             attn, hidden_states, encoder_hidden_states
@@ -113,6 +119,7 @@ class SACFluxAttnProcessor:
         # q k v shape: (batch_size, seq_len, heads, head_dim) [1, 4608, 24, 128]
         # to use attn.get_attention_scores() we need to reshape to (batch_size * heads, seq_len, head_dim)
         batch_size, seq_len, heads, head_dim = query.shape
+        assert seq_len == self.seq_len
         query = query.permute(0, 2, 1, 3).reshape(-1, query.shape[1], query.shape[3])
         key = key.permute(0, 2, 1, 3).reshape(-1, key.shape[1], key.shape[3])
         value = value.permute(0, 2, 1, 3).reshape(-1, value.shape[1], value.shape[3])
@@ -128,26 +135,15 @@ class SACFluxAttnProcessor:
         
         if self.step_idx < inject_threshold:
             import math
-            
-            # 🔥 修复：动态计算文本 Token 数量
-            if self.num_text is None and block_type == TransType.DOUBLE:
-                # Double 块：文本和图像分开
-                num_txt = encoder_hidden_states.shape[1]
-                self.num_text = encoder_hidden_states.shape[1]
-            else:
-                # Single 块：文本和图像已经拼接在 query 里了
-                # 图像长度固定为 4096 (1024x1024 打包后)，多出来的都是文本
-                num_txt = self.num_text
-            assert self.num_text is not None
 
-            S_img = seq_len - num_txt # 确保 S_img 永远是 4096
-            
+            latent_seq_len = self.latent_seq_len
+
             # 将图像部分的注意力矩阵重塑为 5D: (batch*heads, Q_y, Q_x, K_y, K_x)
-            grid_size = int(math.sqrt(S_img)) # 这里会完美得到 64
+            grid_size = int(math.sqrt(latent_seq_len)) # 这里会完美得到 64
             mid = grid_size // 2              # 32
 
             # 只截取图像与图像算注意力的部分 (右下角的 4096 x 4096)
-            img_sim = sim[:, num_txt:, num_txt:].view(-1, grid_size, grid_size, grid_size, grid_size)
+            img_sim = sim[:, self.text_seq_len:, self.text_seq_len:].view(-1, grid_size, grid_size, grid_size, grid_size)
 
             # --- 矩阵克隆开始 ---
             # 目标: B' (右下, y:mid~end, x:mid~end)
@@ -188,7 +184,7 @@ class SACFluxAttnProcessor:
             # --- 矩阵克隆结束 ---
 
             # 将手术后的注意力矩阵展平放回原处
-            sim[:, num_txt:, num_txt:] = img_sim.view(-1, S_img, S_img)
+            sim[:, self.text_seq_len:, self.text_seq_len:] = img_sim.view(-1, latent_seq_len, latent_seq_len)
 
         # =====================================================================
         # 继续正常的 Softmax 和 Value 聚合
@@ -203,19 +199,19 @@ class SACFluxAttnProcessor:
         # 🌟 Store Image-to-Image Attention Maps
         # =====================================================================
         # Extract L2L part, shape: (batch_size * heads, S_img, S_img)
-        l2l_attn = attention_probs[:, self.num_text:, self.num_text:]
-        
+        l2l_attn = attention_probs[:, self.text_seq_len:, self.text_seq_len:]
+
         # Reshape to separate batch and heads: (batch_size, heads, S_img, S_img)
-        # l2l_attn = l2l_attn.reshape(self.batch_size, heads, S_img, S_img)
+        l2l_attn = l2l_attn.view(self.batch_size, -1, self.latent_seq_len, self.latent_seq_len)
         
         # Average across all heads to reduce memory: (batch_size, S_img, S_img)
-        l2l_attn = l2l_attn.mean(dim=0)
+        l2l_attn_avg = l2l_attn.mean(dim=1)
         
         # Accumulate the attention maps
         if self.attention_store is None:
-            self.attention_store = l2l_attn
+            self.attention_store = l2l_attn_avg
         else:
-            self.attention_store += l2l_attn
+            self.attention_store += l2l_attn_avg
         # =====================================================================
 
         hidden_states = torch.bmm(attention_probs, value)
@@ -238,7 +234,6 @@ class SACFluxAttnProcessor:
         else:
             ret = hidden_states
 
-        print(f"完成第 {self.step_idx} 步，第 {self.block_idx[block_type]} 个 {block_type.name} 块的注意力计算。")
         self.block_idx[block_type] += 1
         if block_type is TransType.SINGLE and self.block_idx[block_type] >= num_blocks:
             self.block_idx = [0, 0]
